@@ -24,16 +24,16 @@ class CDCProcessor:
         # Try different encodings
         for encoding in ['utf-8', 'latin-1', 'iso-8859-1', 'cp1252']:
             try:
-                return pd.read_csv(StringIO(content.decode(encoding)))
+                return pd.read_csv(StringIO(content.decode(encoding)), sep='|')
             except UnicodeDecodeError:
                 continue
         
         # If all fail, use latin-1 with errors='replace'
-        return pd.read_csv(StringIO(content.decode('latin-1', errors='replace')))
+        return pd.read_csv(StringIO(content.decode('latin-1', errors='replace')), sep='|')
     
     def write_csv(self, key):
         buffer = StringIO()
-        self.df.to_csv(buffer, index=False)
+        self.df.to_csv(buffer, index=False, sep='|')
         s3.put_object(Bucket=self.bucket, Key=key, Body=buffer.getvalue())
         return f"s3://{self.bucket}/{key}"
     
