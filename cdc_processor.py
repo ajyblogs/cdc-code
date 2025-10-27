@@ -55,8 +55,8 @@ class CDCProcessor:
         return f"{prefix}LOAD00000001.csv"
     
     def list_cdc_files(self, prefix):
-        """List all CDC files (non-LOAD files)"""
-        return [f for f in self.list_s3_files(prefix) if 'LOAD' not in f]
+        """List all CDC files (non-LOAD files), excluding processed folder"""
+        return [f for f in self.list_s3_files(prefix) if 'LOAD' not in f and '/processed/' not in f]
     
     def move_to_processed(self, key):
         processed_key = f"{key.rsplit('/', 1)[0]}/processed/{key.split('/')[-1]}"
