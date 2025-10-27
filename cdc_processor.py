@@ -59,18 +59,41 @@ class CDCProcessor:
         return [f for f in self.list_s3_files(prefix) if 'LOAD' not in f and '/processed/' not in f]
     
     def move_to_processed(self, key):
-        processed_key = f"{key.rsplit('/', 1)[0]}/processed/{key.split('/')[-1]}"
+        """Move CDC file to processed folder at DSET level"""
+        # Extract path parts: land/cin/dflt/g5c/DSET00030052/DRPG5C_DBO/DA_AW_PROJ_CATG/file.csv
+        # Target: land/cin/dflt/g5c/DSET00030052/processed/DRPG5C_DBO/DA_AW_PROJ_CATG/file.csv
+        parts = key.split('/')
+        
+        # Find DSET position and insert 'processed' after it
+        for i, part in enumerate(parts):
+            if part.startswith('DSET'):
+                # Reconstruct path with 'processed' after DSET
+                processed_key = '/'.join(parts[:i+1] + ['processed'] + parts[i+1:])
+                break
+        else:
+            # Fallback if DSET not found
+            processed_key = f"{key.rsplit('/', 1)[0]}/processed/{key.split('/')[-1]}"
+        
         s3.copy_object(CopySource={'Bucket': self.bucket, 'Key': key}, Bucket=self.bucket, Key=processed_key)
         s3.delete_object(Bucket=self.bucket, Key=key)
         return processed_key
     
     def move_load_to_processed(self, key):
-        """Move LOAD file to processed folder with timestamp"""
+        """Move LOAD file to processed folder at DSET level with timestamp"""
         timestamp = datetime.utcnow().strftime('%Y%m%d%H%M%S')
         filename = key.split('/')[-1]
-        # Replace LOAD00000001.csv with LOAD00000001_20241026120000.csv
         new_filename = filename.replace('.csv', f'_{timestamp}.csv')
-        processed_key = f"{key.rsplit('/', 1)[0]}/processed/{new_filename}"
+        
+        # Extract path parts and insert 'processed' after DSET
+        parts = key.split('/')
+        for i, part in enumerate(parts):
+            if part.startswith('DSET'):
+                # Reconstruct path with 'processed' after DSET and new filename
+                processed_key = '/'.join(parts[:i+1] + ['processed'] + parts[i+1:-1] + [new_filename])
+                break
+        else:
+            # Fallback if DSET not found
+            processed_key = f"{key.rsplit('/', 1)[0]}/processed/{new_filename}"
         
         s3.copy_object(CopySource={'Bucket': self.bucket, 'Key': key}, Bucket=self.bucket, Key=processed_key)
         s3.delete_object(Bucket=self.bucket, Key=key)
