@@ -99,35 +99,97 @@ class CDCProcessor:
         logger.info(f"Moved LOAD file to: {processed_key}")
         return processed_key
     
+    def find_matching_rows(self, row, data_cols):
+        """
+        Find matching rows in the dataframe using all data columns.
+        Returns a boolean mask of matching rows.
+        """
+        if len(self.df) == 0:
+            return pd.Series([False])
+        
+        mask = pd.Series([True] * len(self.df), index=self.df.index)
+        
+        for col in data_cols:
+            if col not in self.df.columns:
+                continue
+                
+            row_val = row[col]
+            df_col = self.df[col]
+            
+            # Handle different data types and NaN values
+            if pd.isna(row_val):
+                mask &= pd.isna(df_col)
+            else:
+                # Convert to string for comparison to handle mixed types
+                mask &= (df_col.astype(str).str.strip() == str(row_val).strip())
+        
+        return mask
+    
     def apply_operation(self, row):
         op = str(row[self.op_col]).strip().upper()
         
-        # Create mask using all data columns (excluding operation column)
-        data_cols = [col for col in row.index if col != self.op_col and col in self.df.columns]
-        mask = pd.Series([True] * len(self.df))
-        for col in data_cols:
-            mask &= (self.df[col] == row[col])
+        # Get data columns (excluding operation column)
+        data_cols = [col for col in row.index if col != self.op_col]
+        
+        # Find matching rows
+        mask = self.find_matching_rows(row, data_cols)
+        matching_count = mask.sum()
+        
+        logger.debug(f"Operation: {op}, Matching rows: {matching_count}")
         
         if op in ['I', 'INSERT']:
-            if not mask.any():
-                self.df = pd.concat([self.df, row.drop(self.op_col).to_frame().T], ignore_index=True)
-            return 'I'
+            # Insert only if row doesn't exist
+            if matching_count == 0:
+                # Create new row without operation column
+                new_row = row.drop(self.op_col).to_frame().T
+                # Ensure all columns from df are present
+                for col in self.df.columns:
+                    if col not in new_row.columns:
+                        new_row[col] = None
+                self.df = pd.concat([self.df, new_row[self.df.columns]], ignore_index=True)
+                logger.debug(f"Inserted new row. Total rows: {len(self.df)}")
+                return 'I'
+            else:
+                logger.debug(f"Insert skipped - row already exists")
+                return 'X'
+                
         elif op in ['U', 'UPDATE']:
-            if mask.any():
+            # Update matching rows
+            if matching_count > 0:
                 for col in data_cols:
-                    self.df.loc[mask, col] = row[col]
-            return 'U'
+                    if col in self.df.columns:
+                        self.df.loc[mask, col] = row[col]
+                logger.debug(f"Updated {matching_count} row(s)")
+                return 'U'
+            else:
+                logger.debug(f"Update skipped - no matching rows found")
+                return 'X'
+                
         elif op in ['D', 'DELETE']:
-            if mask.any():
+            # Delete matching rows
+            if matching_count > 0:
                 self.df = self.df[~mask].reset_index(drop=True)
-            return 'D'
+                logger.debug(f"Deleted {matching_count} row(s). Total rows: {len(self.df)}")
+                return 'D'
+            else:
+                logger.debug(f"Delete skipped - no matching rows found")
+                return 'X'
+        
+        logger.warning(f"Unknown operation: {op}")
         return 'X'
     
     def process_cdc_file(self, cdc_df):
         ops = {'I': 0, 'U': 0, 'D': 0, 'X': 0}
-        for _, row in cdc_df.iterrows():
+        
+        logger.info(f"Processing {len(cdc_df)} CDC records")
+        
+        for idx, row in cdc_df.iterrows():
             op = self.apply_operation(row)
             ops[op] += 1
+            
+            if (idx + 1) % 100 == 0:
+                logger.info(f"Processed {idx + 1}/{len(cdc_df)} records")
+        
         return ops
     
     def run(self, load_prefix, cdc_prefix):
@@ -135,38 +197,70 @@ class CDCProcessor:
         
         # Load historic file
         load_key = self.get_load_file(load_prefix)
-        self.df = self.read_csv(load_key)
-        initial_rows = len(self.df)
+        logger.info(f"Loading base file: {load_key}")
+        
+        try:
+            self.df = self.read_csv(load_key)
+            initial_rows = len(self.df)
+            logger.info(f"Loaded {initial_rows} rows from base file")
+            logger.info(f"Base file columns: {list(self.df.columns)}")
+        except Exception as e:
+            logger.error(f"Error reading base file: {str(e)}")
+            raise
         
         # Get all CDC files
         cdc_files = self.list_cdc_files(cdc_prefix)
         if not cdc_files:
+            logger.info("No CDC files found to process")
             return {'status': 'success', 'message': 'No CDC files', 'table_name': self.table}
+        
+        logger.info(f"Found {len(cdc_files)} CDC file(s) to process: {cdc_files}")
         
         # Initialize columns from first CDC
         first_cdc = self.read_csv(cdc_files[0])
         self.op_col = first_cdc.columns[0]
         logger.info(f"Operation column: {self.op_col}")
+        logger.info(f"CDC file columns: {list(first_cdc.columns)}")
         logger.info(f"Using all columns for row matching (no primary key)")
+        
+        # Verify column alignment
+        cdc_data_cols = [col for col in first_cdc.columns if col != self.op_col]
+        missing_in_base = set(cdc_data_cols) - set(self.df.columns)
+        missing_in_cdc = set(self.df.columns) - set(cdc_data_cols)
+        
+        if missing_in_base:
+            logger.warning(f"Columns in CDC but not in base file: {missing_in_base}")
+        if missing_in_cdc:
+            logger.warning(f"Columns in base file but not in CDC: {missing_in_cdc}")
         
         # Process all CDC files
         total_ops = {'I': 0, 'U': 0, 'D': 0, 'X': 0}
-        for cdc_file in cdc_files:
+        for i, cdc_file in enumerate(cdc_files, 1):
+            logger.info(f"Processing CDC file {i}/{len(cdc_files)}: {cdc_file}")
+            
             cdc_df = self.read_csv(cdc_file) if cdc_file != cdc_files[0] else first_cdc
+            logger.info(f"CDC file has {len(cdc_df)} records")
+            
             ops = self.process_cdc_file(cdc_df)
+            logger.info(f"Operations applied: I={ops['I']}, U={ops['U']}, D={ops['D']}, Skipped={ops['X']}")
+            
             for k, v in ops.items():
                 total_ops[k] += v
-            self.move_to_processed(cdc_file)
+            
+            # Move processed file
+            processed_location = self.move_to_processed(cdc_file)
+            logger.info(f"Moved to: {processed_location}")
         
         # Move original LOAD file to processed folder
         self.move_load_to_processed(load_key)
         
         # Save updated LOAD file with same name and location
         output_loc = self.write_csv(load_key)
+        logger.info(f"Saved updated base file: {output_loc}")
         
         end = datetime.utcnow()
         
-        return {
+        result = {
             'status': 'success',
             'table_name': self.table,
             'initial_rows': initial_rows,
@@ -177,6 +271,9 @@ class CDCProcessor:
             'output_location': output_loc,
             'processing_time_seconds': (end - start).total_seconds()
         }
+        
+        logger.info(f"Processing complete: {json.dumps(result, default=str)}")
+        return result
 
 def parse_s3_event(event):
     """
@@ -250,6 +347,7 @@ def lambda_handler(event, context):
             'body': json.dumps({
                 'status': 'error',
                 'message': str(e),
-                'table_name': event.get('table_name', 'unknown')
+                'table_name': event.get('table_name', 'unknown'),
+                'traceback': str(e)
             })
         }
