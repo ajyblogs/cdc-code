@@ -1,7 +1,7 @@
 import json
 import boto3
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime
 from io import StringIO
 import logging
 
@@ -178,15 +178,71 @@ class CDCProcessor:
             'processing_time_seconds': (end - start).total_seconds()
         }
 
+def parse_s3_event(event):
+    """
+    Parse S3 event to extract bucket name, table name, and key information.
+    
+    Expected S3 path structure:
+    bucket-name/prefix/table_name/file.csv
+    
+    Returns: bucket_name, table_name, file_key
+    """
+    logger.info(f"Received event: {json.dumps(event)}")
+    
+    # Handle S3 event structure
+    if 'Records' in event:
+        record = event['Records'][0]
+        bucket_name = record['s3']['bucket']['name']
+        file_key = record['s3']['object']['key']
+        
+        # Extract table_name from the path
+        # Expected path: prefix/table_name/file.csv or prefix/schema/table_name/file.csv
+        path_parts = file_key.split('/')
+        
+        # The table name is typically the folder containing the file
+        # Assuming structure: .../table_name/file.csv or .../schema/table_name/file.csv
+        if len(path_parts) >= 2:
+            table_name = path_parts[-2]  # Folder name before the file
+        else:
+            table_name = 'unknown'
+        
+        logger.info(f"Parsed - Bucket: {bucket_name}, Table: {table_name}, Key: {file_key}")
+        return bucket_name, table_name, file_key
+    
+    # Fallback for direct invocation with parameters
+    elif 'bucket_name' in event and 'table_name' in event:
+        return event['bucket_name'], event['table_name'], event.get('file_key', '')
+    
+    else:
+        raise ValueError("Invalid event structure. Expected S3 event or direct parameters.")
+
 def lambda_handler(event, context):
     try:
-        logger.info(f"Processing table: {event['table_name']}")
-        processor = CDCProcessor(event['bucket_name'], event['table_name'])
-        result = processor.run(
-            event['load_file_prefix'],
-            event['cdc_prefix']
-        )
-        return {'statusCode': 200, 'body': json.dumps(result, default=str)}
+        # Parse S3 event to get bucket and table information
+        bucket_name, table_name, file_key = parse_s3_event(event)
+        
+        # Extract prefix from file_key (everything before the filename)
+        # Example: land/cin/dflt/g5c/DSET00030052/DRPG5C_DBO/DA_AW_PROJ_CATG/file.csv
+        # Prefix: land/cin/dflt/g5c/DSET00030052/DRPG5C_DBO/DA_AW_PROJ_CATG/
+        prefix = '/'.join(file_key.split('/')[:-1]) + '/'
+        
+        # Hard-coded prefix paths based on the prefix structure
+        load_file_prefix = prefix
+        cdc_prefix = prefix
+        
+        logger.info(f"Processing table: {table_name}")
+        logger.info(f"Load file prefix: {load_file_prefix}")
+        logger.info(f"CDC prefix: {cdc_prefix}")
+        
+        # Process CDC files
+        processor = CDCProcessor(bucket_name, table_name)
+        result = processor.run(load_file_prefix, cdc_prefix)
+        
+        return {
+            'statusCode': 200,
+            'body': json.dumps(result, default=str)
+        }
+        
     except Exception as e:
         logger.error(f"Error: {str(e)}", exc_info=True)
         return {
