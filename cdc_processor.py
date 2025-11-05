@@ -318,6 +318,30 @@ def lambda_handler(event, context):
         # Parse S3 event to get bucket and table information
         bucket_name, table_name, file_key = parse_s3_event(event)
         
+        # Skip if file is in processed folder
+        if '/processed/' in file_key:
+            logger.info(f"Skipping file in processed folder: {file_key}")
+            return {
+                'statusCode': 200,
+                'body': json.dumps({
+                    'status': 'skipped',
+                    'message': 'File is in processed folder',
+                    'file_key': file_key
+                })
+            }
+        
+        # Skip if file is LOAD file (should not trigger processing)
+        if 'LOAD' in file_key:
+            logger.info(f"Skipping LOAD file: {file_key}")
+            return {
+                'statusCode': 200,
+                'body': json.dumps({
+                    'status': 'skipped',
+                    'message': 'LOAD files do not trigger CDC processing',
+                    'file_key': file_key
+                })
+            }
+        
         # Extract prefix from file_key (everything before the filename)
         # Example: land/cin/dflt/g5c/DSET00030052/DRPG5C_DBO/DA_AW_PROJ_CATG/file.csv
         # Prefix: land/cin/dflt/g5c/DSET00030052/DRPG5C_DBO/DA_AW_PROJ_CATG/
