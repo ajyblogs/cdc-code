@@ -135,8 +135,6 @@ class CDCProcessor:
         mask = self.find_matching_rows(row, data_cols)
         matching_count = mask.sum()
         
-        logger.debug(f"Operation: {op}, Matching rows: {matching_count}")
-        
         if op in ['I', 'INSERT']:
             # Insert only if row doesn't exist
             if matching_count == 0:
@@ -147,10 +145,10 @@ class CDCProcessor:
                     if col not in new_row.columns:
                         new_row[col] = None
                 self.df = pd.concat([self.df, new_row[self.df.columns]], ignore_index=True)
-                logger.debug(f"Inserted new row. Total rows: {len(self.df)}")
+                logger.info(f"✓ INSERT: Added new row. Total rows now: {len(self.df)}")
                 return 'I'
             else:
-                logger.debug(f"Insert skipped - row already exists")
+                logger.debug(f"⊘ INSERT SKIPPED: Row already exists")
                 return 'X'
                 
         elif op in ['U', 'UPDATE']:
@@ -159,36 +157,48 @@ class CDCProcessor:
                 for col in data_cols:
                     if col in self.df.columns:
                         self.df.loc[mask, col] = row[col]
-                logger.debug(f"Updated {matching_count} row(s)")
+                logger.info(f"✓ UPDATE: Updated {matching_count} row(s)")
                 return 'U'
             else:
-                logger.debug(f"Update skipped - no matching rows found")
+                logger.debug(f"⊘ UPDATE SKIPPED: No matching rows found")
                 return 'X'
                 
         elif op in ['D', 'DELETE']:
             # Delete matching rows
             if matching_count > 0:
                 self.df = self.df[~mask].reset_index(drop=True)
-                logger.debug(f"Deleted {matching_count} row(s). Total rows: {len(self.df)}")
+                logger.info(f"✓ DELETE: Deleted {matching_count} row(s). Total rows now: {len(self.df)}")
                 return 'D'
             else:
-                logger.debug(f"Delete skipped - no matching rows found")
+                logger.debug(f"⊘ DELETE SKIPPED: No matching rows found")
                 return 'X'
         
-        logger.warning(f"Unknown operation: {op}")
+        logger.warning(f"⚠ UNKNOWN OPERATION: {op}")
         return 'X'
     
     def process_cdc_file(self, cdc_df):
         ops = {'I': 0, 'U': 0, 'D': 0, 'X': 0}
         
-        logger.info(f"Processing {len(cdc_df)} CDC records")
+        logger.info(f"=" * 60)
+        logger.info(f"Starting to process {len(cdc_df)} CDC records")
+        logger.info(f"=" * 60)
         
         for idx, row in cdc_df.iterrows():
             op = self.apply_operation(row)
             ops[op] += 1
             
             if (idx + 1) % 100 == 0:
-                logger.info(f"Processed {idx + 1}/{len(cdc_df)} records")
+                logger.info(f"Progress: {idx + 1}/{len(cdc_df)} records | "
+                           f"Inserts: {ops['I']}, Updates: {ops['U']}, Deletes: {ops['D']}, Skipped: {ops['X']}")
+        
+        logger.info(f"=" * 60)
+        logger.info(f"CDC File Processing Complete:")
+        logger.info(f"  ✓ Total Records Processed: {len(cdc_df)}")
+        logger.info(f"  ✓ Successful Inserts: {ops['I']}")
+        logger.info(f"  ✓ Successful Updates: {ops['U']}")
+        logger.info(f"  ✓ Successful Deletes: {ops['D']}")
+        logger.info(f"  ⊘ Skipped Operations: {ops['X']}")
+        logger.info(f"=" * 60)
         
         return ops
     
@@ -236,20 +246,38 @@ class CDCProcessor:
         # Process all CDC files
         total_ops = {'I': 0, 'U': 0, 'D': 0, 'X': 0}
         for i, cdc_file in enumerate(cdc_files, 1):
-            logger.info(f"Processing CDC file {i}/{len(cdc_files)}: {cdc_file}")
+            logger.info(f"\n{'#' * 60}")
+            logger.info(f"Processing CDC File {i}/{len(cdc_files)}")
+            logger.info(f"File: {cdc_file}")
+            logger.info(f"{'#' * 60}")
             
             cdc_df = self.read_csv(cdc_file) if cdc_file != cdc_files[0] else first_cdc
-            logger.info(f"CDC file has {len(cdc_df)} records")
+            logger.info(f"CDC file contains {len(cdc_df)} records")
             
             ops = self.process_cdc_file(cdc_df)
-            logger.info(f"Operations applied: I={ops['I']}, U={ops['U']}, D={ops['D']}, Skipped={ops['X']}")
             
             for k, v in ops.items():
                 total_ops[k] += v
             
             # Move processed file
             processed_location = self.move_to_processed(cdc_file)
-            logger.info(f"Moved to: {processed_location}")
+            logger.info(f"✓ Moved to processed folder: {processed_location}")
+        
+        logger.info(f"\n{'*' * 60}")
+        logger.info(f"ALL CDC FILES PROCESSING SUMMARY")
+        logger.info(f"{'*' * 60}")
+        logger.info(f"Total CDC Files Processed: {len(cdc_files)}")
+        logger.info(f"Initial Row Count: {initial_rows}")
+        logger.info(f"Final Row Count: {len(self.df)}")
+        logger.info(f"Net Change: {len(self.df) - initial_rows:+d} rows")
+        logger.info(f"")
+        logger.info(f"Operation Breakdown:")
+        logger.info(f"  ✓ Total Inserts (I): {total_ops['I']}")
+        logger.info(f"  ✓ Total Updates (U): {total_ops['U']}")
+        logger.info(f"  ✓ Total Deletes (D): {total_ops['D']}")
+        logger.info(f"  ⊘ Total Skipped (X): {total_ops['X']}")
+        logger.info(f"  = Total Operations: {sum(total_ops.values())}")
+        logger.info(f"{'*' * 60}\n")
         
         # Move original LOAD file to processed folder
         self.move_load_to_processed(load_key)
