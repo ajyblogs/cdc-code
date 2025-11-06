@@ -1,0 +1,230 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: 'AWS::Serverless-2016-10-31'
+Description: CloudFormation template for Athena Table Creator Lambda
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, acceptance, prod]
+    Description: Environment name for resource tagging
+
+  Lifecycle:
+    Type: String
+
+  SubnetIds:
+    Type: List<AWS::SSM::Parameter::Value<List<String>>>
+    Default: /provisioning/core/vpc/default/subnet/compute/connected/SubnetIds
+
+  ApplicationShortName:
+    Type: String
+
+  DataBucket:
+    Type: String
+    Description: S3 bucket containing the data for Athena tables
+
+  LambdaIAMRoleARN:
+    Type: String
+    Description: IAM role ARN for Lambda
+
+  DatabaseName:
+    Type: String
+    Description: Athena/Glue database name
+
+  VersionNumber:
+    Type: String
+    Description: Dynamic Parameter for custom resource invocation
+
+  DMSOutputFilename:
+    Type: String
+    Default: LOAD000000001.csv
+
+  S3EventPrefix:
+    Type: String
+    Description: S3 prefix to filter CDC file uploads (e.g., land/cin/dflt/g5c/)
+    Default: 'land/cin/dflt/g5c/'
+
+Resources:
+  AthenaTableCreatorLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: lambda_function.lambda_handler
+      Role: !Ref LambdaIAMRoleARN
+      FunctionName: !Sub "${ApplicationShortName}-refresh-and-update-glue-catalog-tables"
+      CodeUri: ./lambda_function
+      Runtime: python3.12
+      Timeout: 300
+      MemorySize: 256
+      VpcConfig:
+        SecurityGroupIds:
+          - !Sub '{{resolve:ssm:/drpg5c/common/sg/ComputeLambdaSG}}'
+          - !Sub '{{resolve:ssm:/drpg5c/common/sg/ComputeInternalSG}}'
+          - !Sub '{{resolve:ssm:/provisioning/core/vpc/default/secgrp/compute/connected/CommonSecurityGroupId}}'
+        SubnetIds: !Ref SubnetIds
+      Environment:
+        Variables:
+          DATA_BUCKET: !Ref DataBucket
+          DATABASE_NAME: !Ref DatabaseName
+          DMS_OUTPUT_FILENAME: !Ref DMSOutputFilename
+      Tags:
+        CostCenter: !Sub '{{resolve:ssm:/drpg5c/common/CostCenter}}'
+        Lifecycle: !Ref Lifecycle
+        ProjectCode: !Sub '{{resolve:ssm:/drpg5c/common/ProjectCode}}'
+        AssetID: !Sub '{{resolve:ssm:/drpg5c/common/AssetID}}'
+        AppCode: !Sub '{{resolve:ssm:/drpg5c/common/AppCode}}'
+        RITM: !Sub '{{resolve:ssm:/drpg5c/common/RITM}}'
+        ENVAlertGroup: !Sub '{{resolve:ssm:/drpg5c/common/ENVAlertGroup}}'
+        ApplicationShortName: !Ref ApplicationShortName
+        Component: 'drpg5c'
+
+  # CDC Processor Lambda
+  CDCProcessorLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: cdc_processor.lambda_handler
+      Role: !Ref LambdaIAMRoleARN
+      FunctionName: !Sub "${ApplicationShortName}-cdc-processor"
+      CodeUri: ./cdc_processor
+      Runtime: python3.12
+      Timeout: 900
+      MemorySize: 512
+      VpcConfig:
+        SecurityGroupIds:
+          - !Sub '{{resolve:ssm:/drpg5c/common/sg/ComputeLambdaSG}}'
+          - !Sub '{{resolve:ssm:/drpg5c/common/sg/ComputeInternalSG}}'
+          - !Sub '{{resolve:ssm:/provisioning/core/vpc/default/secgrp/compute/connected/CommonSecurityGroupId}}'
+        SubnetIds: !Ref SubnetIds
+      Layers:
+        - !Sub 'arn:aws:lambda:${AWS::Region}:336392948345:layer:AWSSDKPandas-Python312:13'
+      Events:
+        S3CDCUpload:
+          Type: S3
+          Properties:
+            Bucket: !Ref DataBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: !Ref S3EventPrefix
+                  - Name: suffix
+                    Value: .csv
+      Tags:
+        CostCenter: !Sub '{{resolve:ssm:/drpg5c/common/CostCenter}}'
+        Lifecycle: !Ref Lifecycle
+        ProjectCode: !Sub '{{resolve:ssm:/drpg5c/common/ProjectCode}}'
+        AssetID: !Sub '{{resolve:ssm:/drpg5c/common/AssetID}}'
+        AppCode: !Sub '{{resolve:ssm:/drpg5c/common/AppCode}}'
+        RITM: !Sub '{{resolve:ssm:/drpg5c/common/RITM}}'
+        ENVAlertGroup: !Sub '{{resolve:ssm:/drpg5c/common/ENVAlertGroup}}'
+        ApplicationShortName: !Ref ApplicationShortName
+        Component: 'drpg5c'
+
+  TriggerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: index.lambda_handler
+      InlineCode: |
+        import json
+        import boto3
+        import cfnresponse
+        import logging
+
+        logger = logging.getLogger()
+        logger.setLevel(logging.INFO)
+
+        def lambda_handler(event, context):
+            try:
+                logger.info(f"Received event: {json.dumps(event)}")
+                
+                if event['RequestType'] in ['Create', 'Update']:
+                    # Invoke the Glue table creator Lambda
+                    lambda_client = boto3.client('lambda')
+                    response = lambda_client.invoke(
+                        FunctionName=event['ResourceProperties']['TableCreatorFunction'],
+                        InvocationType='RequestResponse',
+                        Payload=json.dumps({})
+                    )
+                    
+                    # Parse the response
+                    payload = json.loads(response['Payload'].read().decode())
+                    logger.info(f"Table creator response: {payload}")
+                    
+                    # Check if the table creation was successful
+                    if response.get('StatusCode') == 200:
+                        cfnresponse.send(event, context, cfnresponse.SUCCESS,
+                            {'Message': 'Tables created successfully'})
+                    else:
+                        error_msg = payload.get('body', {}).get('error', 'Unknown error')
+                        cfnresponse.send(event, context, cfnresponse.FAILED,
+                            {'Error': f'Table creation failed: {error_msg}'})
+                
+                elif event['RequestType'] == 'Delete':
+                    # Just return success for delete events
+                    cfnresponse.send(event, context, cfnresponse.SUCCESS,
+                        {'Message': 'Delete request processed'})
+                        
+            except Exception as ee:
+                logger.error(f"Error: {str(ee)}")
+                cfnresponse.send(event, context, cfnresponse.FAILED,
+                    {'Error': str(ee)})
+      Runtime: python3.12
+      Timeout: 300
+      MemorySize: 128
+      Role: !Ref LambdaIAMRoleARN
+      FunctionName: !Sub "${ApplicationShortName}-trigger-refresh-and-update-glue-catalog-tables-lambda"
+      VpcConfig:
+        SecurityGroupIds:
+          - !Sub '{{resolve:ssm:/drpg5c/common/sg/ComputeLambdaSG}}'
+          - !Sub '{{resolve:ssm:/drpg5c/common/ag/ComputeInternalSG}}'
+          - !Sub '{{resolve:ssm:/provisioning/core/vpc/default/secgrp/compute/connected/CommonSecurityGroupId}}'
+        SubnetIds: !Ref SubnetIds
+      Tags:
+        CostCenter: !Sub '{{resolve:ssm:/drpg5c/common/CostCenter}}'
+        Lifecycle: !Ref Lifecycle
+        ProjectCode: !Sub '{{resolve:ssm:/drpg5c/common/ProjectCode}}'
+        AssetID: !Sub '{{resolve:ssm:/drpg5c/common/AssetID}}'
+        AppCode: !Sub '{{resolve:ssm:/drpg5c/common/AppCode}}'
+        RITM: !Sub '{{resolve:ssm:/drpg5c/common/RITM}}'
+        ENVAlertGroup: !Sub '{{resolve:ssm:/drpg5c/common/ENVAlertGroup}}'
+        ApplicationShortName: !Ref ApplicationShortName
+        Component: 'drpg5c'
+
+  # Custom Resource that triggers the table creation
+  TableCreationTrigger:
+    Type: Custom::TableCreationTrigger
+    Properties:
+      ServiceToken: !GetAtt TriggerFunction.Arn
+      TableCreatorFunction: !GetAtt AthenaTableCreatorLambda.Arn
+      VersionNumber: !Ref VersionNumber
+      UpdateToken: !Sub '${AWS::StackName}-${AWS::Region}-${AWS::AccountId}'
+      Tags:
+        - Key: CostCenter
+          Value: !Sub '{{resolve:ssm:/drpg5c/common/CostCenter}}'
+        - Key: Lifecycle
+          Value: !Ref Lifecycle
+        - Key: ProjectCode
+          Value: !Sub '{{resolve:ssm:/drpg5c/common/ProjectCode}}'
+        - Key: AssetID
+          Value: !Sub '{{resolve:ssm:/drpg5c/common/AssetID}}'
+        - Key: AppCode
+          Value: !Sub '{{resolve:ssm:/drpg5c/common/AppCode}}'
+        - Key: RITM
+          Value: !Sub '{{resolve:ssm:/drpg5c/common/RITM}}'
+        - Key: ENVAlertGroup
+          Value: !Sub '{{resolve:ssm:/drpg5c/common/ENVAlertGroup}}'
+        - Key: ApplicationShortName
+          Value: !Ref ApplicationShortName
+        - Key: Component
+          Value: 'drpg5c'
+      DependsOn:
+        - AthenaTableCreatorLambda
+
+Outputs:
+  LambdaArn:
+    Description: ARN of the created Lambda function
+    Value: !GetAtt AthenaTableCreatorLambda.Arn
+  
+  CDCProcessorLambdaArn:
+    Description: ARN of the CDC Processor Lambda function
+    Value: !GetAtt CDCProcessorLambda.Arn
