@@ -57,8 +57,8 @@ Resources:
       MemorySize: 256
       VpcConfig:
         SecurityGroupIds:
-          - !Sub '{{resolve:ssm:/drpg5c/common/sg/ComputeLambdaSG}}'
-          - !Sub '{{resolve:ssm:/drpg5c/common/sg/ComputeInternalSG}}'
+          - !Sub '{{resolve:ssm:/drpg5c/common/sg/ComputeLambdaId}}'
+          - !Sub '{{resolve:ssm:/drpg5c/common/sg/ComputeInterAppId}}'
           - !Sub '{{resolve:ssm:/provisioning/core/vpc/default/secgrp/compute/connected/CommonSecurityGroupId}}'
         SubnetIds: !Ref SubnetIds
       Environment:
@@ -73,7 +73,7 @@ Resources:
         AssetID: !Sub '{{resolve:ssm:/drpg5c/common/AssetID}}'
         AppCode: !Sub '{{resolve:ssm:/drpg5c/common/AppCode}}'
         RITM: !Sub '{{resolve:ssm:/drpg5c/common/RITM}}'
-        EMAlertGroup: !Sub '{{resolve:ssm:/drpg5c/common/EMAlertGroup}}'
+        EMMAlertGroup: !Sub '{{resolve:ssm:/drpg5c/common/EMMAlertGroup}}'
         ApplicationShortName: !Ref ApplicationShortName
         Component: 'drpg5c'
 
@@ -89,8 +89,8 @@ Resources:
       MemorySize: 512
       VpcConfig:
         SecurityGroupIds:
-          - !Sub '{{resolve:ssm:/drpg5c/common/sg/ComputeLambdaSG}}'
-          - !Sub '{{resolve:ssm:/drpg5c/common/sg/ComputeInternalSG}}'
+          - !Sub '{{resolve:ssm:/drpg5c/common/sg/ComputeLambdaId}}'
+          - !Sub '{{resolve:ssm:/drpg5c/common/sg/ComputeInterAppId}}'
           - !Sub '{{resolve:ssm:/provisioning/core/vpc/default/secgrp/compute/connected/CommonSecurityGroupId}}'
         SubnetIds: !Ref SubnetIds
       Layers:
@@ -102,7 +102,7 @@ Resources:
         AssetID: !Sub '{{resolve:ssm:/drpg5c/common/AssetID}}'
         AppCode: !Sub '{{resolve:ssm:/drpg5c/common/AppCode}}'
         RITM: !Sub '{{resolve:ssm:/drpg5c/common/RITM}}'
-        EMAlertGroup: !Sub '{{resolve:ssm:/drpg5c/common/EMAlertGroup}}'
+        EMMAlertGroup: !Sub '{{resolve:ssm:/drpg5c/common/EMMAlertGroup}}'
         ApplicationShortName: !Ref ApplicationShortName
         Component: 'drpg5c'
 
@@ -123,10 +123,10 @@ Resources:
         import boto3
         import cfnresponse
         import logging
-
+        
         logger = logging.getLogger()
         logger.setLevel(logging.INFO)
-
+        
         def lambda_handler(event, context):
             try:
                 logger.info(f"Received event: {json.dumps(event)}")
@@ -158,7 +158,7 @@ Resources:
                         }
                     )
                     logger.info(f"Added S3 event notification for Lambda: {cdc_lambda_arn}")
-
+        
                     # Invoke the Glue table creator Lambda
                     lambda_client = boto3.client('lambda')
                     response = lambda_client.invoke(
@@ -204,8 +204,8 @@ Resources:
       FunctionName: !Sub "${ApplicationShortName}-trigger-refresh-and-update-glue-catalog-tables-lambda"
       VpcConfig:
         SecurityGroupIds:
-          - !Sub '{{resolve:ssm:/drpg5c/common/sg/ComputeLambdaSG}}'
-          - !Sub '{{resolve:ssm:/drpg5c/common/sg/ComputeInternalSG}}'
+          - !Sub '{{resolve:ssm:/drpg5c/common/sg/ComputeLambdaId}}'
+          - !Sub '{{resolve:ssm:/drpg5c/common/sg/ComputeInterAppId}}'
           - !Sub '{{resolve:ssm:/provisioning/core/vpc/default/secgrp/compute/connected/CommonSecurityGroupId}}'
         SubnetIds: !Ref SubnetIds
       Tags:
@@ -215,7 +215,7 @@ Resources:
         AssetID: !Sub '{{resolve:ssm:/drpg5c/common/AssetID}}'
         AppCode: !Sub '{{resolve:ssm:/drpg5c/common/AppCode}}'
         RITM: !Sub '{{resolve:ssm:/drpg5c/common/RITM}}'
-        EMAlertGroup: !Sub '{{resolve:ssm:/drpg5c/common/EMAlertGroup}}'
+        EMMAlertGroup: !Sub '{{resolve:ssm:/drpg5c/common/EMMAlertGroup}}'
         ApplicationShortName: !Ref ApplicationShortName
         Component: 'drpg5c'
 
