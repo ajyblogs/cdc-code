@@ -74,6 +74,20 @@ class CDCProcessor:
 
         return sorted(files)
 
+    def extract_table_name(self, key):
+        """Extract table name from S3 key path."""
+        parts = key.split('/')
+        for part in parts:
+            if part.startswith('DSET'):
+                return part
+        return 'unknown'
+
+    def get_load_prefix(self, cdc_key):
+        """Derive LOAD file prefix from CDC file path."""
+        parts = cdc_key.split('/')
+        # Remove filename and return path up to table folder
+        return '/'.join(parts[:-1]) + '/'
+
     def apply_cdc_operation(self, row):
         """Apply single CDC operation."""
         op = str(row[self.op_col]).strip().upper()
@@ -100,24 +114,27 @@ class CDCProcessor:
 
         return 'X'
 
-    def process(self, load_prefix, cdc_prefix):
-        """Main processing logic."""
+    def process(self, cdc_key):
+        """Main processing logic triggered by S3 event."""
         start = datetime.utcnow()
 
-        # Load base file
+        # Derive paths from CDC file
+        load_prefix = self.get_load_prefix(cdc_key)
         load_key = f"{load_prefix}LOAD00000001.csv"
+
+        # Load base file
         logger.info(f"Loading: {load_key}")
         self.df = self.read_csv(load_key)
         initial_rows = len(self.df)
 
-        # Get CDC files
-        cdc_files = self.list_cdc_files(cdc_prefix)
+        # Get all CDC files in the same folder
+        cdc_files = self.list_cdc_files(load_prefix)
 
         if not cdc_files:
             logger.info("No CDC files found")
             return {
                 'status': 'success',
-                'message': 'No CDC files',
+                'message': 'No CDC files to process',
                 'table_name': self.table
             }
 
@@ -132,15 +149,16 @@ class CDCProcessor:
         ops = {'I': 0, 'U': 0, 'D': 0, 'X': 0}
 
         for i, cdc_file in enumerate(cdc_files):
+            logger.info(f"Processing CDC file {i+1}/{len(cdc_files)}: {cdc_file}")
             cdc_df = first_cdc if i == 0 else self.read_csv(cdc_file)
 
             for _, row in cdc_df.iterrows():
                 op = self.apply_cdc_operation(row)
                 ops[op] += 1
 
-        # Move CDC to processed
-        processed_path = self.get_processed_path(cdc_file)
-        self.move_file(cdc_file, processed_path)
+            # Move each CDC file to processed after processing
+            processed_path = self.get_processed_path(cdc_file)
+            self.move_file(cdc_file, processed_path)
 
         # Move LOAD to processed with timestamp
         load_processed = self.get_processed_path(load_key, add_timestamp=True)
@@ -163,13 +181,51 @@ class CDCProcessor:
 
 
 def lambda_handler(event, context):
-    """Lambda entry point."""
+    """Lambda entry point for S3 events."""
     try:
-        processor = CDCProcessor(event['bucket_name'], event['table_name'])
-        result = processor.process(event['load_file_prefix'], event['cdc_prefix'])
-
-        logger.info(f"Success: {json.dumps(result)}")
-        return {'statusCode': 200, 'body': json.dumps(result)}
+        # Parse S3 event
+        for record in event.get('Records', []):
+            # Extract S3 object details
+            bucket = record['s3']['bucket']['name']
+            key = record['s3']['object']['key']
+            
+            logger.info(f"S3 Event received - Bucket: {bucket}, Key: {key}")
+            
+            # Skip if file is in processed folder
+            if '/processed/' in key:
+                logger.info(f"Skipping processed file: {key}")
+                continue
+            
+            # Skip if not a CSV file
+            if not key.endswith('.csv'):
+                logger.info(f"Skipping non-CSV file: {key}")
+                continue
+            
+            # Skip if it's a LOAD file
+            if 'LOAD' in key:
+                logger.info(f"Skipping LOAD file: {key}")
+                continue
+            
+            # Process CDC file
+            table_name = key.split('/')[-1].split('_')[0] if '_' in key else 'unknown'
+            processor = CDCProcessor(bucket, table_name)
+            
+            # Extract table name from path
+            processor.table = processor.extract_table_name(key)
+            
+            result = processor.process(key)
+            logger.info(f"Success: {json.dumps(result)}")
+            
+            return {'statusCode': 200, 'body': json.dumps(result)}
+        
+        # No valid records to process
+        return {
+            'statusCode': 200,
+            'body': json.dumps({
+                'status': 'skipped',
+                'message': 'No valid CDC files to process'
+            })
+        }
 
     except Exception as e:
         logger.error(f"Error: {str(e)}", exc_info=True)
@@ -178,6 +234,6 @@ def lambda_handler(event, context):
             'body': json.dumps({
                 'status': 'error',
                 'message': str(e),
-                'table_name': event.get('table_name', 'unknown')
+                'table_name': 'unknown'
             })
         }
