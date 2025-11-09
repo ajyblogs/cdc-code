@@ -143,6 +143,7 @@ Resources:
                         NotificationConfiguration={
                             'LambdaFunctionConfigurations': [
                                 {
+                                    'Id': 'cdc_event_notification',
                                     'LambdaFunctionArn': cdc_lambda_arn,
                                     'Events': ['s3:ObjectCreated:*'],
                                     'Filter': {
