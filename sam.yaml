@@ -137,6 +137,12 @@ Resources:
                     bucket = event['ResourceProperties']['DataBucket']
                     cdc_lambda_arn = event['ResourceProperties']['CDCProcessorArn']
                     s3_prefix = event['ResourceProperties']['S3EventPrefix']
+
+                    response = s3_client.put_bucket_notification_configuration(
+                        Bucket=bucket,
+                        NotificationConfiguration={}
+                    )
+                    logger.info("Removing S3 event notification")
                     
                     response = s3_client.put_bucket_notification_configuration(
                         Bucket=bucket,
@@ -182,15 +188,6 @@ Resources:
                             {'Error': f'Table creation failed: {error_msg}'})
                 
                 elif event['RequestType'] == 'Delete':
-                    # Remove S3 event notification
-                    s3_client = boto3.client('s3')
-                    bucket = event['ResourceProperties']['DataBucket']
-                    
-                    response = s3_client.put_bucket_notification_configuration(
-                        Bucket=bucket,
-                        NotificationConfiguration={}
-                    )
-                    logger.info("Removed S3 event notification")
                     cfnresponse.send(event, context, cfnresponse.SUCCESS,
                         {'Message': 'Delete request processed'})
                         
