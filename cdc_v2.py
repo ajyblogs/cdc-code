@@ -115,9 +115,6 @@ class CDCProcessor:
         elif op in ['D', 'DELETE']:
             # Pick only columns present in both DF and CDC row (excluding op col)
             data_cols = [col for col in row.index if col != self.op_col and col in self.df.columns]
-            if not data_cols:
-                logger.warning("DELETE skipped — no matching columns to compare.")
-                return 'X'
             # Create a boolean mask initialized to True
             mask = pd.Series([True] * len(self.df), index=self.df.index)
             for col in data_cols:
