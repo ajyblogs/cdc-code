@@ -88,19 +88,18 @@ class CDCProcessor:
         # Remove filename and return path up to table folder
         return '/'.join(parts[:-1]) + '/'
 
-    def apply_operation(self, row):
+    def apply_cdc_operation(self, row):
+        """Apply single CDC operation."""
         op = str(row[self.op_col]).strip().upper()
-        
-        # Create mask using all data columns (excluding operation column)
-        data_cols = [col for col in row.index if col != self.op_col and col in self.df.columns]
-        mask = pd.Series([True] * len(self.df))
-        for col in data_cols:
-            mask &= (self.df[col] == row[col])
-        
+        pk_val = row[self.pk_col]
+        mask = self.df[self.pk_col] == pk_val
+
         if op in ['I', 'INSERT']:
-            if not mask.any():
-                self.df = pd.concat([self.df, row.drop(self.op_col).to_frame().T], ignore_index=True)
+            new_row = row.drop(self.op_col).to_frame().T
+            self.df = pd.concat([self.df, new_row], ignore_index=True)
             return 'I'
+
+        # ----- UPDATE -----
         elif op in ['U', 'UPDATE']:
             if mask.any():
                 for col in row.index:
@@ -111,10 +110,17 @@ class CDCProcessor:
                 new_row = row.drop(self.op_col).to_frame().T
                 self.df = pd.concat([self.df, new_row], ignore_index=True)
             return 'U'
+
+        # ----- DELETE -----
         elif op in ['D', 'DELETE']:
+            data_cols = [col for col in row.index if col != self.op_col and col in self.df.columns]
+            mask = pd.Series([True] * len(self.df))
+            for col in data_cols:
+                mask &= (self.df[col] == row[col])
             if mask.any():
                 self.df = self.df[~mask].reset_index(drop=True)
             return 'D'
+
         return 'X'
 
     def process(self, cdc_key):
