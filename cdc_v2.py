@@ -113,15 +113,35 @@ class CDCProcessor:
 
         # ----- DELETE -----
         elif op in ['D', 'DELETE']:
+            # Pick only columns present in both DF and CDC row (excluding op col)
             data_cols = [col for col in row.index if col != self.op_col and col in self.df.columns]
-            mask = pd.Series([True] * len(self.df))
+            if not data_cols:
+                logger.warning("DELETE skipped — no matching columns to compare.")
+                return 'X'
+            # Create a boolean mask initialized to True
+            mask = pd.Series([True] * len(self.df), index=self.df.index)
             for col in data_cols:
-                mask &= (self.df[col] == row[col])
+                # Normalize both sides to string for comparison
+                df_col = self.df[col].astype(str).str.strip().str.lower().fillna("")
+                cdc_value = str(row[col]).strip().lower()
+                mask &= (df_col == cdc_value)
+        
             if mask.any():
-                self.df = self.df[~mask].reset_index(drop=True)
-            return 'D'
+                self.df = self.df.loc[~mask].reset_index(drop=True)
+                return 'D'
+            else:
+                logger.warning("DELETE skipped — no exact string match found for row.")
+                return 'X'
+        # elif op in ['D', 'DELETE']:
+        #     data_cols = [col for col in row.index if col != self.op_col and col in self.df.columns]
+        #     mask = pd.Series([True] * len(self.df))
+        #     for col in data_cols:
+        #         mask &= (self.df[col] == row[col])
+        #     if mask.any():
+        #         self.df = self.df[~mask].reset_index(drop=True)
+        #     return 'D'
 
-        return 'X'
+        # return 'X'
 
     def process(self, cdc_key):
         """Main processing logic triggered by S3 event."""
