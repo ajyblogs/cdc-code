@@ -94,19 +94,25 @@ class CDCProcessor:
         pk_val = row[self.pk_col]
         mask = self.df[self.pk_col] == pk_val
 
+        # ----- INSERT ----- #
         if op in ['I', 'INSERT']:
-            if not mask.any():
-                new_row = row.drop(self.op_col).to_frame().T
-                self.df = pd.concat([self.df, new_row], ignore_index=True)
+            new_row = row.drop(self.op_col).to_frame().T
+            self.df = pd.concat([self.df, new_row], ignore_index=True)
             return 'I'
 
+        # ----- UPDATE ----- #
         elif op in ['U', 'UPDATE']:
             if mask.any():
                 for col in row.index:
                     if col != self.op_col and col in self.df.columns:
                         self.df.loc[mask, col] = row[col]
+            else:
+                # If record missing → auto insert (optional)
+                new_row = row.drop(self.op_col).to_frame().T
+                self.df = pd.concat([self.df, new_row], ignore_index=True)
             return 'U'
 
+        # ----- DELETE ----- #
         elif op in ['D', 'DELETE']:
             if mask.any():
                 self.df = self.df[~mask].reset_index(drop=True)
