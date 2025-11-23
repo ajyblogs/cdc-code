@@ -88,10 +88,26 @@ class CDCProcessor:
         # Remove filename and return path up to table folder
         return '/'.join(parts[:-1]) + '/'
 
+    def match_by_primary_key(self, row):
+        """
+        Create a mask that matches only the primary key column.
+        Performs normalized string comparison.
+        """
+        # Normalize both sides: convert to string, strip whitespace, lowercase, handle NaN
+        df_col = self.df[self.pk_col].astype(str).str.strip().str.lower()
+        df_col = df_col.replace('nan', '')
+        
+        cdc_value = str(row[self.pk_col]).strip().lower()
+        if cdc_value == 'nan':
+            cdc_value = ''
+        
+        return df_col == cdc_value
+
     def match_all_columns(self, row, exclude_op_col=True):
         """
         Create a mask that matches all columns in the CDC row against the DataFrame.
         Performs normalized string comparison for all columns.
+        Used for DELETE operations.
         """
         # Get columns to match (exclude operation column if needed)
         cols_to_match = [col for col in row.index 
@@ -129,19 +145,19 @@ class CDCProcessor:
             return 'I'
 
         elif op in ['U', 'UPDATE']:
-            # UPDATE: Match all columns to find the row to update
-            mask = self.match_all_columns(row, exclude_op_col=True)
+            # UPDATE: Match by PRIMARY KEY only, then update with new values
+            mask = self.match_by_primary_key(row)
             
             if mask.any():
-                # Update all matched rows with new values
+                # Update all matched rows with new values from CDC row
                 for col in row.index:
                     if col != self.op_col and col in self.df.columns:
                         self.df.loc[mask, col] = row[col]
-                logger.info(f"UPDATE: Matched {mask.sum()} row(s)")
+                logger.info(f"UPDATE: Matched and updated {mask.sum()} row(s) by PK")
                 return 'U'
             else:
                 # No match found - insert as new row (optional behavior)
-                logger.warning("UPDATE: No matching row found, inserting as new")
+                logger.warning("UPDATE: No matching PK found, inserting as new row")
                 new_row = row.drop(self.op_col).to_frame().T
                 self.df = pd.concat([self.df, new_row], ignore_index=True)
                 return 'U'
