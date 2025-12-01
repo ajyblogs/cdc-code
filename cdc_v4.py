@@ -203,7 +203,7 @@ class CDCProcessor:
         # Write updated LOAD
         output = self.write_csv(load_key)
 
-        return {
+        logger.info({
             'status': 'success',
             'table_name': self.table,
             'initial_rows': initial_rows,
@@ -213,7 +213,7 @@ class CDCProcessor:
             'operations': {'inserts': ops['I'], 'updates': ops['U'], 'deletes': ops['D'], 'skipped': ops['X']},
             'output_location': output,
             'processing_time_seconds': (datetime.utcnow() - start).total_seconds()
-        }
+        })
 
 
 # ------------------------
