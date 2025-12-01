@@ -11,7 +11,7 @@ s3 = boto3.client('s3')
 
 
 class CDCProcessor:
-    def __init__(self, bucket, table, chunk_size=300):
+    def __init__(self, bucket, table, chunk_size=10000):
         self.bucket = bucket
         self.table = table
         self.df = None
@@ -184,7 +184,6 @@ class CDCProcessor:
 
         output = self.write_csv(load_key)
 
-        # 🔥 YOUR ORIGINAL RETURN BLOCK EXACTLY PRESERVED
         return {
             'status': 'success',
             'table_name': self.table,
