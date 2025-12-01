@@ -98,7 +98,6 @@ class CDCProcessor:
 
         output = self.write_output(output_key)
 
-        # ⭐ Do NOT remove this — keeping your original return block EXACTLY
         return {
             'status': 'success',
             'table_name': self.table,
