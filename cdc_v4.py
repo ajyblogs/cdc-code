@@ -19,9 +19,9 @@ class CDCProcessor:
         self.op_col = None
 
     # ------------------------
-    # Read CSV from S3 in chunks
+    # Read CSV in chunks
     # ------------------------
-    def read_csv_chunks(self, key, chunksize=500):
+    def read_csv_chunks(self, key, chunksize=5000):
         try:
             obj = s3.get_object(Bucket=self.bucket, Key=key)
             stream = obj['Body']
@@ -76,6 +76,23 @@ class CDCProcessor:
                 if key.endswith('.csv') and 'LOAD' not in key and '/processed/' not in key:
                     files.append(key)
         return sorted(files)
+
+    # ------------------------
+    # Extract table name from path
+    # ------------------------
+    def extract_table_name(self, key):
+        parts = key.split('/')
+        for part in parts:
+            if part.startswith('DSET'):
+                return part
+        return 'unknown'
+
+    # ------------------------
+    # Get LOAD prefix
+    # ------------------------
+    def get_load_prefix(self, cdc_key):
+        parts = cdc_key.split('/')
+        return '/'.join(parts[:-1]) + '/'
 
     # ------------------------
     # Match primary key
@@ -146,9 +163,10 @@ class CDCProcessor:
     # ------------------------
     def process(self, cdc_key):
         start = datetime.utcnow()
-        load_prefix = '/'.join(cdc_key.split('/')[:-1]) + '/'
+        load_prefix = self.get_load_prefix(cdc_key)
         load_key = f"{load_prefix}LOAD00000001.csv"
 
+        # Load base table in chunks
         logger.info(f"Loading base file {load_key}")
         chunk_list = []
         for chunk in self.read_csv_chunks(load_key, chunksize=300):
@@ -156,15 +174,18 @@ class CDCProcessor:
         self.df = pd.concat(chunk_list, ignore_index=True)
         initial_rows = len(self.df)
 
+        # List CDC files
         cdc_files = self.list_cdc_files(load_prefix)
         if not cdc_files:
             logger.info("No CDC files found")
             return {'status': 'success', 'message': 'No CDC files to process', 'table_name': self.table}
 
+        # Setup PK and OP column
         first_cdc = next(self.read_csv_chunks(cdc_files[0], chunksize=300))
         self.pk_col = self.df.columns[0]
         self.op_col = first_cdc.columns[0]
 
+        # Apply CDC
         ops = {'I': 0, 'U': 0, 'D': 0, 'X': 0}
         for i, cdc_file in enumerate(cdc_files):
             logger.info(f"Processing CDC file {i+1}/{len(cdc_files)}: {cdc_file}")
@@ -175,8 +196,11 @@ class CDCProcessor:
             processed_path = self.get_processed_path(cdc_file)
             self.move_file(cdc_file, processed_path)
 
+        # Move LOAD file to processed
         load_processed = self.get_processed_path(load_key, add_timestamp=True)
         self.move_file(load_key, load_processed)
+
+        # Write updated LOAD
         output = self.write_csv(load_key)
 
         return {
@@ -207,6 +231,7 @@ def lambda_handler(event, context):
                 continue
 
             processor = CDCProcessor(bucket, key.split('/')[-2])
+            processor.table = processor.extract_table_name(key)
             result = processor.process(key)
             return {'statusCode': 200, 'body': json.dumps(result)}
 
