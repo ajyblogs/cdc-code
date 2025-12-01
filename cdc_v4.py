@@ -101,7 +101,6 @@ class CDCProcessor:
         ops = self.apply_cdc_files(cdc_files)
         output = self.write_output(output_key)
 
-        # 🔥 Original return block preserved
         return {
             'status': 'success',
             'table_name': self.table,
