@@ -141,4 +141,24 @@ class CDCProcessorArrow:
             "processing_time_seconds": (datetime.utcnow() - start).total_seconds(),
         }, indent=2))
 
-        return True
+# -----------------------------
+# Lambda Handler
+# -----------------------------
+def lambda_handler(event, context):
+    try:
+        for r in event.get("Records", []):
+            bucket = r["s3"]["bucket"]["name"]
+            key = r["s3"]["object"]["key"]
+
+            if "/processed/" in key or not key.endswith(".csv") or "LOAD" in key:
+                continue
+
+            table_name = key.split("/")[-2]
+            processor = CDCProcessorArrow(bucket, table_name)
+            processor.process(key)
+
+        return {"statusCode": 200, "body": json.dumps({"status": "success"})}
+
+    except Exception as e:
+        logger.error(f"Error in CDC processing: {e}", exc_info=True)
+        return {"statusCode": 500, "body": json.dumps({"status": "error", "message": str(e)})}
