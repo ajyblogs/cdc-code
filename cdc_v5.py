@@ -18,7 +18,6 @@ class CDCProcessorArrow:
         self.table = table
         self.df: pa.Table | None = None
         self.pk_col = None
-        self.op_col = None
 
         logger.info(f"CDC Processor initialized for bucket={bucket}, table={table}")
 
@@ -71,11 +70,11 @@ class CDCProcessorArrow:
         return f"s3://{self.bucket}/{key}"
 
     # -------------------------------------------------
-    # FIX: Schema Alignment
+    # FIX: Schema Alignment (excluding op column)
     # -------------------------------------------------
-    def align_schema(self, tbl, target_schema):
+    def align_schema(self, tbl, target_schema, op_col_name):
         """
-        Ensures CDC table has same schema as LOAD.
+        Ensures CDC table (minus op column) has same schema as LOAD.
         - Missing columns → added as null column
         - Type mismatches → cast to LOAD type (fallback: cast to string)
         """
@@ -88,24 +87,41 @@ class CDCProcessorArrow:
                     logger.info(f"Type mismatch in column '{name}' → {col.type} vs {field.type}, casting...")
                     try:
                         col = pc.cast(col, field.type)
-                    except Exception:
-                        logger.info(f"Failed to cast column '{name}' to {field.type}, forcing STRING type")
-                        col = pc.cast(col, pa.string())
+                    except Exception as e:
+                        logger.warning(f"Failed to cast column '{name}' to {field.type}: {e}, forcing STRING type")
+                        try:
+                            col = pc.cast(col, pa.string())
+                        except Exception as e2:
+                            logger.error(f"Failed to cast to string: {e2}, using nulls")
+                            col = pa.array([None] * tbl.num_rows, type=field.type)
                 cols[name] = col
             else:
                 logger.info(f"Missing column '{name}' in CDC → filling nulls")
                 cols[name] = pa.array([None] * tbl.num_rows, type=field.type)
-        return pa.Table.from_arrays(list(cols.values()), names=[f.name for f in target_schema])
+        
+        # Re-add operation column at the beginning
+        if op_col_name in tbl.column_names:
+            return pa.Table.from_arrays(
+                [tbl[op_col_name]] + list(cols.values()), 
+                names=[op_col_name] + [f.name for f in target_schema]
+            )
+        else:
+            raise ValueError(f"Operation column '{op_col_name}' not found in CDC table")
 
     # -------------------------------------------------
     # SAFE UTF8_UPPER for op column
     # -------------------------------------------------
     def safe_upper(self, arr: pa.Array):
-        if pa.types.is_string(arr.type):
-            return pc.utf8_upper(arr)
-        # convert any type to string first
-        arr = pc.cast(arr, pa.string(), safe=False)
-        return pc.utf8_upper(arr)
+        """Safely convert array to uppercase strings"""
+        try:
+            if pa.types.is_string(arr.type) or pa.types.is_large_string(arr.type):
+                return pc.utf8_upper(arr)
+            # Convert to string first
+            str_arr = pc.cast(arr, pa.string())
+            return pc.utf8_upper(str_arr)
+        except Exception as e:
+            logger.warning(f"Failed to uppercase array: {e}, returning as-is")
+            return arr
 
     # -------------------------------------------------
     # Main CDC Processor
@@ -133,32 +149,37 @@ class CDCProcessorArrow:
         target_schema = self.df.schema
         cdc_tables = []
 
-        logger.info("Aligning CDC schemas to LOAD schema")
+        logger.info("Loading and aligning CDC files...")
 
+        # First, peek at first CDC file to get operation column name
+        first_cdc = self.load_arrow_table(cdc_files[0])
+        op_col_name = first_cdc.column_names[0]
+        logger.info(f"Operation column detected: {op_col_name}")
+
+        # Load and align all CDC files
         for f in cdc_files:
             raw_tbl = self.load_arrow_table(f)
-            aligned = self.align_schema(raw_tbl, target_schema)
+            aligned = self.align_schema(raw_tbl, target_schema, op_col_name)
             cdc_tables.append(aligned)
 
         # Merge all CDC rows
         cdc_all = pa.concat_tables(cdc_tables)
         logger.info(f"Combined CDC rows after alignment: {cdc_all.num_rows}")
 
-        self.op_col = cdc_all.column_names[0]
-
         # -------------------------------------------------
         # SAFE OP PARSING
         # -------------------------------------------------
-        op_arr = cdc_all[self.op_col]
+        op_arr = cdc_all[op_col_name]
         op_arr = self.safe_upper(op_arr)
 
+        # Filter by operation type
         df_ins = cdc_all.filter(pc.equal(op_arr, pa.scalar("I")))
         df_upd = cdc_all.filter(pc.equal(op_arr, pa.scalar("U")))
         df_del = cdc_all.filter(pc.equal(op_arr, pa.scalar("D")))
 
         logger.info(f"CDC Ops → INSERT={df_ins.num_rows}, UPDATE={df_upd.num_rows}, DELETE={df_del.num_rows}")
 
-        # Drop op column
+        # Drop op column from data tables
         df_ins = df_ins.remove_column(0)
         df_upd = df_upd.remove_column(0)
         df_del = df_del.remove_column(0)
@@ -167,7 +188,7 @@ class CDCProcessorArrow:
         # DELETE
         # -------------------------------------------------
         if df_del.num_rows > 0:
-            del_pk_set = set(df_del[self.pk_col].to_pylist())
+            del_pk_set = pa.array(df_del[self.pk_col].to_pylist())
             mask = pc.invert(pc.is_in(self.df[self.pk_col], value_set=del_pk_set))
             before = self.df.num_rows
             self.df = self.df.filter(mask)
@@ -177,7 +198,7 @@ class CDCProcessorArrow:
         # UPDATE
         # -------------------------------------------------
         if df_upd.num_rows > 0:
-            upd_pk_set = set(df_upd[self.pk_col].to_pylist())
+            upd_pk_set = pa.array(df_upd[self.pk_col].to_pylist())
             mask = pc.invert(pc.is_in(self.df[self.pk_col], value_set=upd_pk_set))
             before = self.df.num_rows
             self.df = self.df.filter(mask)
@@ -205,7 +226,7 @@ class CDCProcessorArrow:
         out = self.write_arrow_table(load_file, self.df)
         final_rows = self.df.num_rows
 
-        logger.info({
+        result = {
             "status": "success",
             "initial_rows": initial_rows,
             "final_rows": final_rows,
@@ -215,7 +236,8 @@ class CDCProcessorArrow:
             "deletes": df_del.num_rows,
             "output": out,
             "time_sec": (datetime.utcnow() - start).total_seconds()
-        })
+        }
+        logger.info(json.dumps(result))
 
 
 # -------------------------------------------------
