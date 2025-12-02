@@ -1,15 +1,14 @@
 import json
 import boto3
 import pyarrow as pa
-import pyarrow.csv as pa_csv
-import pyarrow.parquet as pq
+import pyarrow.csv as csv
 import pyarrow.compute as pc
 from datetime import datetime
 import logging
+from io import BytesIO
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
-
 s3 = boto3.client("s3")
 
 
@@ -17,140 +16,205 @@ class CDCProcessorArrow:
     def __init__(self, bucket, table):
         self.bucket = bucket
         self.table = table
-        self.df = None
+        self.df: pa.Table | None = None
         self.pk_col = None
+        self.op_col = None
+        logger.info(f"Initialized CDCProcessorArrow for table={table}, bucket={bucket}")
 
-    # ---------------------- UTILITIES ----------------------
-
+    # -----------------------------
+    # Helper functions
+    # -----------------------------
     def extract_table_name(self, key):
-        return key.split("/")[-1].split(".")[0]
+        for part in key.split("/"):
+            if part.startswith("DSET"):
+                return part
+        return "unknown"
 
+    def get_load_prefix(self, key):
+        prefix = "/".join(key.split("/")[:-1]) + "/"
+        logger.info(f"Load prefix resolved: {prefix}")
+        return prefix
+
+    def get_processed_path(self, key, add_timestamp=False):
+        parts = key.split("/")
+        for i, p in enumerate(parts):
+            if p.startswith("DSET"):
+                filename = parts[-1]
+                if add_timestamp:
+                    ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+                    filename = filename.replace(".csv", f"_{ts}.csv")
+                processed_path = "/".join(parts[:i+1] + ["processed"] + parts[i+1:-1] + [filename])
+                logger.info(f"Processed path resolved: {key} → {processed_path}")
+                return processed_path
+        raise ValueError("Invalid path structure")
+
+    def move_file(self, src, dst):
+        logger.info(f"Moving file from {src} to {dst}")
+        s3.copy_object(Bucket=self.bucket, Key=dst, CopySource={"Bucket": self.bucket, "Key": src})
+        s3.delete_object(Bucket=self.bucket, Key=src)
+        logger.info(f"Moved: {src} → {dst}")
+
+    def list_cdc_files(self, prefix):
+        logger.info(f"Listing CDC files under prefix: {prefix}")
+        paginator = s3.get_paginator("list_objects_v2")
+        out = []
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                if key.endswith(".csv") and "LOAD" not in key and "/processed/" not in key:
+                    out.append(key)
+        logger.info(f"CDC files discovered: {out}")
+        return sorted(out)
+
+    # -----------------------------
+    # Load and write Arrow tables
+    # -----------------------------
     def load_arrow_table(self, key):
-        logger.info(f"Loading base table: s3://{self.bucket}/{key}")
-
+        logger.info(f"Loading Arrow table from S3: {key}")
         obj = s3.get_object(Bucket=self.bucket, Key=key)
-        table = pa_parquet.read_table(obj["Body"])
+        tbl = csv.read_csv(obj["Body"], parse_options=csv.ParseOptions(delimiter="|"))
+        logger.info(f"Loaded table: {key} → {tbl.num_rows} rows, {tbl.num_columns} columns")
+        return tbl
 
-        logger.info(f"Loaded base table with {table.num_rows} rows.")
-        return table
+    def write_arrow_table(self, key, table):
+        logger.info(f"Writing updated Arrow table to S3: {key}, rows={table.num_rows}")
+        buf = table.to_pandas().to_csv(index=False, sep="|").encode()
+        s3.put_object(Bucket=self.bucket, Key=key, Body=buf)
+        logger.info(f"Write complete: s3://{self.bucket}/{key}")
+        return f"s3://{self.bucket}/{key}"
 
-    def write_arrow_table(self, table, key):
-        logger.info(f"Writing final table to: s3://{self.bucket}/{key}")
-        buf = pa.BufferOutputStream()
-        pq.write_table(table, buf)
-        s3.put_object(Bucket=self.bucket, Key=key, Body=buf.getvalue())
-        logger.info("Write complete.")
-
-    def scan_csv_chunks(self, key, batch_size=500):
-        logger.info(f"Streaming CDC file: {key}")
-        obj = s3.get_object(Bucket=self.bucket, Key=key)
-        reader = pa_csv.open_csv(obj["Body"])
-
-        for batch in reader.read_batches(batch_size=batch_size):
-            yield batch.to_table()
-
-    # ---------------------- CDC LOGIC ----------------------
-
-    def merge_insert(self, base, cdc):
-        logger.info(f"Applying INSERT operations for {cdc.num_rows} rows")
-        return pa.concat_tables([base, cdc], promote=True)
-
-    def merge_update(self, base, cdc):
-        logger.info(f"Applying UPDATE for {cdc.num_rows} rows")
-
-        # remove rows that match PK
-        pk = self.pk_col
-        base_no_match = base.filter(pc.is_in(base[pk], value_set=cdc[pk]).invert())
-
-        # add updated rows
-        return pa.concat_tables([base_no_match, cdc], promote=True)
-
-    def merge_delete(self, base, cdc):
-        logger.info(f"Applying DELETE for {cdc.num_rows} rows")
-        pk = self.pk_col
-        return base.filter(pc.is_in(base[pk], value_set=cdc[pk]).invert())
-
-    # ---------------------- MAIN PROCESS ----------------------
-
-    def process(self, load_key, cdc_files):
-        logger.info("Starting CDC processing using PyArrow...")
-
+    # -----------------------------
+    # Vectorized CDC Processor
+    # -----------------------------
+    def process(self, cdc_key):
+        logger.info(f"Starting CDC processing for key: {cdc_key}")
         start = datetime.utcnow()
-        base = self.load_arrow_table(load_key)
 
-        # Auto-detect PK (first column)
-        self.pk_col = base.column_names[0]
-        logger.info(f"Detected primary key column: {self.pk_col}")
+        prefix = self.get_load_prefix(cdc_key)
+        load_file = f"{prefix}LOAD00000001.csv"
 
-        initial_rows = base.num_rows
-        logger.info(f"Initial row count: {initial_rows}")
+        logger.info(f"Loading base dataset: {load_file}")
+        self.df = self.load_arrow_table(load_file)
+        initial_rows = self.df.num_rows
+        logger.info(f"Initial base table rows: {initial_rows}")
 
-        ops = {"I": 0, "U": 0, "D": 0, "X": 0}
-        total_cdc_rows = 0
+        self.pk_col = self.df.column_names[0]
+        logger.info(f"Primary key column detected: {self.pk_col}")
 
-        for idx, cdc_path in enumerate(cdc_files):
-            logger.info(f"Processing CDC file {idx+1}/{len(cdc_files)}: {cdc_path}")
+        # Collect CDC files
+        cdc_files = self.list_cdc_files(prefix)
+        if not cdc_files:
+            logger.info("No CDC files found. Exiting.")
+            return
 
-            for cdc_chunk in self.scan_csv_chunks(cdc_path):
+        logger.info(f"Total CDC files to ingest: {len(cdc_files)}")
 
-                if "op" not in cdc_chunk.column_names:
-                    logger.warning("CDC chunk missing 'op' column. Skipping.")
-                    continue
+        # Load all CDC files into one table
+        logger.info("Loading all CDC files into Arrow tables")
+        cdc_tables = [self.load_arrow_table(f) for f in cdc_files]
+        cdc_all: pa.Table = pa.concat_tables(cdc_tables)
+        logger.info(f"Combined CDC table rows: {cdc_all.num_rows}")
 
-                total_cdc_rows += cdc_chunk.num_rows
+        self.op_col = cdc_all.column_names[0]
+        logger.info(f"CDC operation column detected: {self.op_col}")
 
-                # Split operations
-                inserts = cdc_chunk.filter(pc.equal(cdc_chunk["op"], "I"))
-                updates = cdc_chunk.filter(pc.equal(cdc_chunk["op"], "U"))
-                deletes = cdc_chunk.filter(pc.equal(cdc_chunk["op"], "D"))
+        # Split into INSERT, UPDATE, DELETE
+        logger.info("Splitting CDC dataset into I/U/D operations")
+        op = pc.utf8_upper(cdc_all[self.op_col])
 
-                if inserts.num_rows > 0:
-                    base = self.merge_insert(base, inserts)
-                    ops["I"] += inserts.num_rows
+        df_ins = cdc_all.filter(pc.equal(op, pa.scalar("I")))
+        df_upd = cdc_all.filter(pc.equal(op, pa.scalar("U")))
+        df_del = cdc_all.filter(pc.equal(op, pa.scalar("D")))
 
-                if updates.num_rows > 0:
-                    base = self.merge_update(base, updates)
-                    ops["U"] += updates.num_rows
+        logger.info(f"CDC breakdown: INSERT={df_ins.num_rows}, UPDATE={df_upd.num_rows}, DELETE={df_del.num_rows}")
 
-                if deletes.num_rows > 0:
-                    base = self.merge_delete(base, deletes)
-                    ops["D"] += deletes.num_rows
+        # Drop op column for alignment
+        df_ins = df_ins.remove_column(df_ins.schema.get_field_index(self.op_col))
+        df_upd = df_upd.remove_column(df_upd.schema.get_field_index(self.op_col))
+        df_del = df_del.remove_column(df_del.schema.get_field_index(self.op_col))
 
-                # Progress every 500 rows
-                if total_cdc_rows % 500 == 0:
-                    logger.info(f"Processed {total_cdc_rows} CDC rows so far...")
+        # -----------------------------
+        # DELETE
+        # -----------------------------
+        if df_del.num_rows > 0:
+            logger.info("Processing DELETE operations")
+            del_pk_set = set(df_del[self.pk_col].to_pylist())
+            logger.info(f"DELETE PK count: {len(del_pk_set)}")
 
-        logger.info("CDC application complete.")
-        logger.info(f"Final row count: {base.num_rows}")
+            mask = pc.invert(pc.is_in(self.df[self.pk_col], value_set=del_pk_set))
+            before = self.df.num_rows
+            self.df = self.df.filter(mask)
+            logger.info(f"DELETE removed {before - self.df.num_rows} rows")
 
-        # Write final output
-        output_key = f"output/{self.table}_final.parquet"
-        self.write_arrow_table(base, output_key)
+        # -----------------------------
+        # UPDATE
+        # -----------------------------
+        if df_upd.num_rows > 0:
+            logger.info("Processing UPDATE operations")
+            upd_pk_set = set(df_upd[self.pk_col].to_pylist())
+            logger.info(f"UPDATE PK count: {len(upd_pk_set)}")
 
-        # Final summary log
-        logger.info(json.dumps({
+            mask = pc.invert(pc.is_in(self.df[self.pk_col], value_set=upd_pk_set))
+            before = self.df.num_rows
+            self.df = self.df.filter(mask)
+            logger.info(f"UPDATE removed old rows: {before - self.df.num_rows}")
+
+            self.df = pa.concat_tables([self.df, df_upd])
+            logger.info(f"UPDATE added new rows: {df_upd.num_rows}")
+
+        # -----------------------------
+        # INSERT
+        # -----------------------------
+        if df_ins.num_rows > 0:
+            logger.info("Processing INSERT operations")
+            self.df = pa.concat_tables([self.df, df_ins])
+            logger.info(f"INSERT added rows: {df_ins.num_rows}")
+
+        # Move CDC files
+        logger.info("Archiving CDC files to /processed/")
+        for f in cdc_files:
+            self.move_file(f, self.get_processed_path(f))
+
+        # Move LOAD file
+        logger.info("Archiving previous LOAD file")
+        load_p = self.get_processed_path(load_file, add_timestamp=True)
+        self.move_file(load_file, load_p)
+
+        # Write updated LOAD
+        logger.info("Writing updated LOAD file")
+        out = self.write_arrow_table(load_file, self.df)
+
+        # Log final summary
+        final_rows = self.df.num_rows
+        logger.info({
             "status": "success",
-            "table_name": self.table,
             "initial_rows": initial_rows,
-            "final_rows": base.num_rows,
-            "row_change": base.num_rows - initial_rows,
-            "cdc_files_processed": len(cdc_files),
-            "total_cdc_rows": total_cdc_rows,
-            "operations": ops,
-            "output_location": output_key,
-            "processing_time_seconds": (datetime.utcnow() - start).total_seconds(),
-        }, indent=2))
+            "final_rows": final_rows,
+            "row_change": final_rows - initial_rows,
+            "inserts": df_ins.num_rows,
+            "updates": df_upd.num_rows,
+            "deletes": df_del.num_rows,
+            "output": out,
+            "processing_time_seconds": (datetime.utcnow() - start).total_seconds()
+        })
+
 
 # -----------------------------
 # Lambda Handler
 # -----------------------------
 def lambda_handler(event, context):
+    logger.info("Lambda triggered with event:")
+    logger.info(json.dumps(event))
+
     try:
         for r in event.get("Records", []):
             bucket = r["s3"]["bucket"]["name"]
             key = r["s3"]["object"]["key"]
 
+            logger.info(f"Processing S3 event object: bucket={bucket}, key={key}")
+
             if "/processed/" in key or not key.endswith(".csv") or "LOAD" in key:
+                logger.info(f"Skipping file (not CDC eligible): {key}")
                 continue
 
             table_name = key.split("/")[-2]
