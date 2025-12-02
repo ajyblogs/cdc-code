@@ -5,10 +5,10 @@ import pyarrow.csv as csv
 import pyarrow.compute as pc
 from datetime import datetime
 import logging
-from io import BytesIO
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
+
 s3 = boto3.client("s3")
 
 
@@ -26,8 +26,7 @@ class CDCProcessorArrow:
     # Helper functions
     # -------------------------------------------------
     def get_load_prefix(self, key):
-        prefix = "/".join(key.split("/")[:-1]) + "/"
-        return prefix
+        return "/".join(key.split("/")[:-1]) + "/"
 
     def get_processed_path(self, key, add_timestamp=False):
         parts = key.split("/")
@@ -37,25 +36,22 @@ class CDCProcessorArrow:
                 if add_timestamp:
                     ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
                     filename = filename.replace(".csv", f"_{ts}.csv")
-                return "/".join(parts[:i+1] + ["processed"] + parts[i+1:-1] + [filename])
+                return "/".join(parts[:i + 1] + ["processed"] + parts[i + 1:-1] + [filename])
         raise ValueError("Invalid CDC directory structure")
 
     def move_file(self, src, dst):
-        s3.copy_object(Bucket=self.bucket, Key=dst,
-                       CopySource={"Bucket": self.bucket, "Key": src})
+        s3.copy_object(Bucket=self.bucket, Key=dst, CopySource={"Bucket": self.bucket, "Key": src})
         s3.delete_object(Bucket=self.bucket, Key=src)
         logger.info(f"Moved file → {src} → {dst}")
 
     def list_cdc_files(self, prefix):
         paginator = s3.get_paginator("list_objects_v2")
         out = []
-
         for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
             for obj in page.get("Contents", []):
                 key = obj["Key"]
                 if key.endswith(".csv") and "LOAD" not in key and "/processed/" not in key:
                     out.append(key)
-
         logger.info(f"CDC files discovered: {out}")
         return sorted(out)
 
@@ -64,10 +60,7 @@ class CDCProcessorArrow:
     # -------------------------------------------------
     def load_arrow_table(self, key):
         obj = s3.get_object(Bucket=self.bucket, Key=key)
-        tbl = csv.read_csv(
-            obj["Body"],
-            parse_options=csv.ParseOptions(delimiter="|")
-        )
+        tbl = csv.read_csv(obj["Body"], parse_options=csv.ParseOptions(delimiter="|"))
         logger.info(f"Loaded table: {key} → rows={tbl.num_rows}, cols={tbl.num_columns}")
         return tbl
 
@@ -87,36 +80,32 @@ class CDCProcessorArrow:
         - Type mismatches → cast to LOAD type (fallback: cast to string)
         """
         cols = {}
-
         for field in target_schema:
             name = field.name
-
             if name in tbl.column_names:
                 col = tbl[name]
-
                 if col.type != field.type:
-                    logger.info(
-                        f"Type mismatch in column '{name}' → {col.type} vs {field.type}, casting..."
-                    )
-
+                    logger.info(f"Type mismatch in column '{name}' → {col.type} vs {field.type}, casting...")
                     try:
                         col = pc.cast(col, field.type)
                     except Exception:
-                        # last fallback: cast to string
-                        logger.info(
-                            f"Failed to cast column '{name}' to {field.type}, forcing STRING type"
-                        )
+                        logger.info(f"Failed to cast column '{name}' to {field.type}, forcing STRING type")
                         col = pc.cast(col, pa.string())
-
                 cols[name] = col
             else:
-                # missing column
                 logger.info(f"Missing column '{name}' in CDC → filling nulls")
                 cols[name] = pa.array([None] * tbl.num_rows, type=field.type)
+        return pa.Table.from_arrays(list(cols.values()), names=[f.name for f in target_schema])
 
-        return pa.Table.from_arrays(
-            list(cols.values()), names=[f.name for f in target_schema]
-        )
+    # -------------------------------------------------
+    # SAFE UTF8_UPPER for op column
+    # -------------------------------------------------
+    def safe_upper(self, arr: pa.Array):
+        if pa.types.is_string(arr.type):
+            return pc.utf8_upper(arr)
+        # convert any type to string first
+        arr = pc.cast(arr, pa.string(), safe=False)
+        return pc.utf8_upper(arr)
 
     # -------------------------------------------------
     # Main CDC Processor
@@ -133,7 +122,6 @@ class CDCProcessorArrow:
         self.df = self.load_arrow_table(load_file)
         initial_rows = self.df.num_rows
         self.pk_col = self.df.column_names[0]
-
         logger.info(f"Primary key column: {self.pk_col}")
 
         # Discover CDC files
@@ -147,7 +135,6 @@ class CDCProcessorArrow:
 
         logger.info("Aligning CDC schemas to LOAD schema")
 
-        # Load and fix schema for each CDC file
         for f in cdc_files:
             raw_tbl = self.load_arrow_table(f)
             aligned = self.align_schema(raw_tbl, target_schema)
@@ -159,11 +146,15 @@ class CDCProcessorArrow:
 
         self.op_col = cdc_all.column_names[0]
 
-        # Split operations
-        op = pc.utf8_upper(cdc_all[self.op_col])
-        df_ins = cdc_all.filter(pc.equal(op, pa.scalar("I")))
-        df_upd = cdc_all.filter(pc.equal(op, pa.scalar("U")))
-        df_del = cdc_all.filter(pc.equal(op, pa.scalar("D")))
+        # -------------------------------------------------
+        # SAFE OP PARSING
+        # -------------------------------------------------
+        op_arr = cdc_all[self.op_col]
+        op_arr = self.safe_upper(op_arr)
+
+        df_ins = cdc_all.filter(pc.equal(op_arr, pa.scalar("I")))
+        df_upd = cdc_all.filter(pc.equal(op_arr, pa.scalar("U")))
+        df_del = cdc_all.filter(pc.equal(op_arr, pa.scalar("D")))
 
         logger.info(f"CDC Ops → INSERT={df_ins.num_rows}, UPDATE={df_upd.num_rows}, DELETE={df_del.num_rows}")
 
@@ -178,7 +169,6 @@ class CDCProcessorArrow:
         if df_del.num_rows > 0:
             del_pk_set = set(df_del[self.pk_col].to_pylist())
             mask = pc.invert(pc.is_in(self.df[self.pk_col], value_set=del_pk_set))
-
             before = self.df.num_rows
             self.df = self.df.filter(mask)
             logger.info(f"DELETE removed rows: {before - self.df.num_rows}")
@@ -189,7 +179,6 @@ class CDCProcessorArrow:
         if df_upd.num_rows > 0:
             upd_pk_set = set(df_upd[self.pk_col].to_pylist())
             mask = pc.invert(pc.is_in(self.df[self.pk_col], value_set=upd_pk_set))
-
             before = self.df.num_rows
             self.df = self.df.filter(mask)
             logger.info(f"UPDATE removed old rows: {before - self.df.num_rows}")
@@ -214,7 +203,6 @@ class CDCProcessorArrow:
 
         # Write updated LOAD
         out = self.write_arrow_table(load_file, self.df)
-
         final_rows = self.df.num_rows
 
         logger.info({
