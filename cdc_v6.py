@@ -285,8 +285,8 @@ class CDCProcessorArrow:
             self.move_file(f, self.get_processed_path(f))
 
         # Archive old LOAD
-        new_load_archive = self.get_processed_path(load_file, add_timestamp=True)
-        self.move_file(load_file, new_load_archive)
+        #new_load_archive = self.get_processed_path(load_file, add_timestamp=True)
+        #self.move_file(load_file, new_load_archive)
 
         # Write updated LOAD
         out = self.write_arrow_table(load_file, self.df)
