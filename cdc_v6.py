@@ -204,70 +204,116 @@ class CDCProcessorArrow:
             logger.info("No CDC files found.")
             return
 
-        logger.info("Loading CDC files...")
+        logger.info(f"Processing {len(cdc_files)} CDC files...")
 
-        # First, peek at first CDC file to get operation column name
+        # First, peek at first CDC file to get operation column name and infer schema
         first_cdc = self.load_arrow_table(cdc_files[0])
         op_col_name = first_cdc.column_names[0]
         logger.info(f"Operation column detected: {op_col_name}")
 
-        # Load all CDC files (raw, before alignment)
-        cdc_tables_raw = [self.load_arrow_table(f) for f in cdc_files]
-
-        # Infer unified schema from LOAD + CDC files
-        unified_schema = self.infer_unified_schema(self.df, cdc_tables_raw, op_col_name)
+        # Sample first few CDC files for schema inference (max 5 to save time)
+        sample_cdc_tables = [first_cdc]
+        for f in cdc_files[1:min(5, len(cdc_files))]:
+            sample_cdc_tables.append(self.load_arrow_table(f))
+        
+        # Infer unified schema from LOAD + sample CDC files
+        unified_schema = self.infer_unified_schema(self.df, sample_cdc_tables, op_col_name)
         logger.info(f"Unified schema: {unified_schema}")
 
         # Upgrade LOAD table to unified schema
         self.df = self.upgrade_load_schema(self.df, unified_schema)
         logger.info("LOAD table upgraded to unified schema")
 
-        # Now align all CDC files to the unified schema
-        cdc_tables = []
-        for raw_tbl in cdc_tables_raw:
-            aligned = self.align_schema(raw_tbl, unified_schema, op_col_name)
-            cdc_tables.append(aligned)
-
-        # Merge all CDC rows
-        cdc_all = pa.concat_tables(cdc_tables)
-        logger.info(f"Combined CDC rows after alignment: {cdc_all.num_rows}")
-
-        # -------------------------------------------------
-        # SAFE OP PARSING
-        # -------------------------------------------------
-        op_arr = cdc_all[op_col_name]
-        op_arr = self.safe_upper(op_arr)
-
-        # Filter by operation type
-        df_ins = cdc_all.filter(pc.equal(op_arr, pa.scalar("I")))
-        df_upd = cdc_all.filter(pc.equal(op_arr, pa.scalar("U")))
-        df_del = cdc_all.filter(pc.equal(op_arr, pa.scalar("D")))
-
+        # Process CDC files in batches to avoid memory issues
+        batch_size = 10
+        all_inserts = []
+        all_updates = []
+        all_deletes = []
+        
+        for i in range(0, len(cdc_files), batch_size):
+            batch = cdc_files[i:i + batch_size]
+            logger.info(f"Processing CDC batch {i//batch_size + 1}/{(len(cdc_files)-1)//batch_size + 1} ({len(batch)} files)")
+            
+            # Load and align batch
+            batch_tables = []
+            for f in batch:
+                raw_tbl = self.load_arrow_table(f)
+                aligned = self.align_schema(raw_tbl, unified_schema, op_col_name)
+                batch_tables.append(aligned)
+            
+            # Merge batch
+            if len(batch_tables) == 1:
+                batch_combined = batch_tables[0]
+            else:
+                batch_combined = pa.concat_tables(batch_tables)
+            
+            logger.info(f"Batch combined: {batch_combined.num_rows} rows")
+            
+            # Parse operations in batch
+            op_arr = self.safe_upper(batch_combined[op_col_name])
+            
+            batch_ins = batch_combined.filter(pc.equal(op_arr, pa.scalar("I"))).remove_column(0)
+            batch_upd = batch_combined.filter(pc.equal(op_arr, pa.scalar("U"))).remove_column(0)
+            batch_del = batch_combined.filter(pc.equal(op_arr, pa.scalar("D"))).remove_column(0)
+            
+            if batch_ins.num_rows > 0:
+                all_inserts.append(batch_ins)
+            if batch_upd.num_rows > 0:
+                all_updates.append(batch_upd)
+            if batch_del.num_rows > 0:
+                all_deletes.append(batch_del)
+        
+        # Combine all operations
+        df_ins = pa.concat_tables(all_inserts) if all_inserts else pa.table({}, schema=unified_schema)
+        df_upd = pa.concat_tables(all_updates) if all_updates else pa.table({}, schema=unified_schema)
+        df_del = pa.concat_tables(all_deletes) if all_deletes else pa.table({}, schema=unified_schema)
+        
         logger.info(f"CDC Ops → INSERT={df_ins.num_rows}, UPDATE={df_upd.num_rows}, DELETE={df_del.num_rows}")
 
-        # Drop op column from data tables
-        df_ins = df_ins.remove_column(0)
-        df_upd = df_upd.remove_column(0)
-        df_del = df_del.remove_column(0)
+
 
         # -------------------------------------------------
         # DELETE
         # -------------------------------------------------
         if df_del.num_rows > 0:
-            del_pk_set = pa.array(df_del[self.pk_col].to_pylist())
-            mask = pc.invert(pc.is_in(self.df[self.pk_col], value_set=del_pk_set))
+            del_pk_list = df_del[self.pk_col].to_pylist()
+            del_pk_set = set(del_pk_list)
+            logger.info(f"DELETE: processing {len(del_pk_set)} unique keys")
+            
+            # Filter out deleted rows
+            current_pks = self.df[self.pk_col].to_pylist()
+            keep_mask = [pk not in del_pk_set for pk in current_pks]
+            keep_indices = [i for i, keep in enumerate(keep_mask) if keep]
+            
             before = self.df.num_rows
-            self.df = self.df.filter(mask)
+            if keep_indices:
+                self.df = self.df.take(keep_indices)
+            else:
+                # All rows deleted, create empty table with same schema
+                self.df = pa.table({col: pa.array([], type=self.df.schema.field(col).type) 
+                                   for col in self.df.column_names})
             logger.info(f"DELETE removed rows: {before - self.df.num_rows}")
 
         # -------------------------------------------------
         # UPDATE
         # -------------------------------------------------
         if df_upd.num_rows > 0:
-            upd_pk_set = pa.array(df_upd[self.pk_col].to_pylist())
-            mask = pc.invert(pc.is_in(self.df[self.pk_col], value_set=upd_pk_set))
+            upd_pk_list = df_upd[self.pk_col].to_pylist()
+            upd_pk_set = set(upd_pk_list)
+            logger.info(f"UPDATE: processing {len(upd_pk_set)} unique keys")
+            
+            # Filter out rows to be updated
+            current_pks = self.df[self.pk_col].to_pylist()
+            keep_mask = [pk not in upd_pk_set for pk in current_pks]
+            keep_indices = [i for i, keep in enumerate(keep_mask) if keep]
+            
             before = self.df.num_rows
-            self.df = self.df.filter(mask)
+            if keep_indices:
+                self.df = self.df.take(keep_indices)
+            else:
+                # All rows updated, create empty table
+                self.df = pa.table({col: pa.array([], type=self.df.schema.field(col).type) 
+                                   for col in self.df.column_names})
             logger.info(f"UPDATE removed old rows: {before - self.df.num_rows}")
 
             self.df = pa.concat_tables([self.df, df_upd])
@@ -285,8 +331,8 @@ class CDCProcessorArrow:
             self.move_file(f, self.get_processed_path(f))
 
         # Archive old LOAD
-        #new_load_archive = self.get_processed_path(load_file, add_timestamp=True)
-        #self.move_file(load_file, new_load_archive)
+        new_load_archive = self.get_processed_path(load_file, add_timestamp=True)
+        self.move_file(load_file, new_load_archive)
 
         # Write updated LOAD
         out = self.write_arrow_table(load_file, self.df)
