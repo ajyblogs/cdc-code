@@ -69,38 +69,115 @@ class CDCProcessorArrow:
         logger.info(f"Written updated LOAD → {key}")
 
     # -------------------------------------------------
-    # Align schema (fix type mismatches, missing cols)
+    # Infer proper schema from CDC files
+    # -------------------------------------------------
+    def infer_unified_schema(self, load_table, cdc_tables, op_col_name):
+        """
+        Build unified schema by inferring types from CDC files when LOAD has null columns.
+        """
+        unified_fields = []
+        
+        for field in load_table.schema:
+            col_name = field.name
+            col_type = field.type
+            
+            # If LOAD column is null type, try to infer from CDC files
+            if pa.types.is_null(col_type):
+                logger.info(f"Column '{col_name}' in LOAD is null type, inferring from CDC files...")
+                inferred_type = None
+                
+                for cdc_tbl in cdc_tables:
+                    if col_name in cdc_tbl.column_names:
+                        cdc_col_type = cdc_tbl.schema.field(col_name).type
+                        if not pa.types.is_null(cdc_col_type):
+                            inferred_type = cdc_col_type
+                            logger.info(f"Inferred type for '{col_name}': {inferred_type}")
+                            break
+                
+                # Use inferred type or default to string
+                if inferred_type:
+                    unified_fields.append(pa.field(col_name, inferred_type))
+                else:
+                    logger.warning(f"Could not infer type for '{col_name}', defaulting to string")
+                    unified_fields.append(pa.field(col_name, pa.string()))
+            else:
+                unified_fields.append(field)
+        
+        return pa.schema(unified_fields)
+
+    # -------------------------------------------------
+    # Convert LOAD table to unified schema
+    # -------------------------------------------------
+    def upgrade_load_schema(self, load_table, unified_schema):
+        """
+        Convert LOAD table columns from null type to proper types.
+        """
+        cols = []
+        for field in unified_schema:
+            col_name = field.name
+            load_col = load_table[col_name]
+            
+            if pa.types.is_null(load_col.type) and not pa.types.is_null(field.type):
+                logger.info(f"Converting LOAD column '{col_name}' from null to {field.type}")
+                # Create array of nulls with correct type
+                cols.append(pa.array([None] * load_table.num_rows, type=field.type))
+            else:
+                cols.append(load_col)
+        
+        return pa.Table.from_arrays(cols, schema=unified_schema)
+
+    # -------------------------------------------------
+    # FIX: Schema Alignment (excluding op column)
     # -------------------------------------------------
     def align_schema(self, tbl, target_schema, op_col_name):
+        """
+        Ensures CDC table (minus op column) has same schema as LOAD.
+        - Missing columns → added as null column
+        - Type mismatches → cast to LOAD type (fallback: cast to string)
+        """
         cols = {}
         for field in target_schema:
             name = field.name
             if name in tbl.column_names:
                 col = tbl[name]
                 if col.type != field.type:
+                    logger.info(f"Type mismatch in column '{name}' → {col.type} vs {field.type}, casting...")
                     try:
                         col = pc.cast(col, field.type)
-                    except:
-                        col = pc.cast(col, pa.string())
+                    except Exception as e:
+                        logger.warning(f"Failed to cast column '{name}' to {field.type}: {e}, forcing STRING type")
+                        try:
+                            col = pc.cast(col, pa.string())
+                        except Exception as e2:
+                            logger.error(f"Failed to cast to string: {e2}, using nulls")
+                            col = pa.array([None] * tbl.num_rows, type=field.type)
                 cols[name] = col
             else:
+                logger.info(f"Missing column '{name}' in CDC → filling nulls")
                 cols[name] = pa.array([None] * tbl.num_rows, type=field.type)
-
-        return pa.Table.from_arrays(
-            [tbl[op_col_name]] + list(cols.values()),
-            names=[op_col_name] + [f.name for f in target_schema]
-        )
+        
+        # Re-add operation column at the beginning
+        if op_col_name in tbl.column_names:
+            return pa.Table.from_arrays(
+                [tbl[op_col_name]] + list(cols.values()), 
+                names=[op_col_name] + [f.name for f in target_schema]
+            )
+        else:
+            raise ValueError(f"Operation column '{op_col_name}' not found in CDC table")
 
     # -------------------------------------------------
-    # SAFE uppercase
+    # SAFE UTF8_UPPER for op column
     # -------------------------------------------------
-    def safe_upper(self, arr):
+    def safe_upper(self, arr: pa.Array):
+        """Safely convert array to uppercase strings"""
         try:
-            arr = arr.combine_chunks()
-            if pa.types.is_string(arr.type):
+            if pa.types.is_string(arr.type) or pa.types.is_large_string(arr.type):
                 return pc.utf8_upper(arr)
-            return pc.utf8_upper(pc.cast(arr, pa.string()))
-        except:
+            # Convert to string first
+            str_arr = pc.cast(arr, pa.string())
+            return pc.utf8_upper(str_arr)
+        except Exception as e:
+            logger.warning(f"Failed to uppercase array: {e}, returning as-is")
             return arr
 
     # -------------------------------------------------
