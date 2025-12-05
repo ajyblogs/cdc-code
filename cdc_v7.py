@@ -13,7 +13,7 @@ s3 = boto3.client("s3")
 
 
 class CDCProcessorArrow:
-    def _init_(self, bucket, table):
+    def __init__(self, bucket, table):
         self.bucket = bucket
         self.table = table
         self.df: pa.Table | None = None
@@ -107,11 +107,13 @@ class CDCProcessorArrow:
     # MAIN PROCESSOR
     # -------------------------------------------------
     def process(self, cdc_key):
+        start = datetime.utcnow()
         prefix = self.get_load_prefix(cdc_key)
         load_file = f"{prefix}LOAD00000001.csv"
 
         # Load base load
         self.df = self.load_arrow_table(load_file)
+        initial_rows = self.df.num_rows
         self.pk_col = self.df.column_names[0]
 
         # Find CDC files
@@ -157,6 +159,8 @@ class CDCProcessorArrow:
         if df_ins.num_rows > 0:
             self.df = pa.concat_tables([self.df, df_ins])
 
+        final_rows = self.df.num_rows
+
         # Move all CDC files
         for f in cdc_files:
             self.move_file(f, self.get_processed_path(f))
@@ -178,11 +182,33 @@ class CDCProcessorArrow:
         # Promote temp → final LOAD
         self.move_file(tmp_load, load_file)
 
+        # -------------------------------------------------
+        # SUMMARY RESULT
+        # -------------------------------------------------
+        result = {
+            "status": "success",
+            "table": self.table,
+            "bucket": self.bucket,
+            "initial_rows": initial_rows,
+            "final_rows": final_rows,
+            "row_change": final_rows - initial_rows,
+            "inserts": df_ins.num_rows,
+            "updates": df_upd.num_rows,
+            "deletes": df_del.num_rows,
+            "cdc_files_processed": len(cdc_files),
+            "load_file": load_file,
+            "time_sec": (datetime.utcnow() - start).total_seconds()
+        }
+        logger.info(f"CDC Processing Summary: {json.dumps(result)}")
+        
+        return result
+
 
 # -------------------------------------------------
 # Lambda handler
 # -------------------------------------------------
 def lambda_handler(event, context):
+    results = []
     try:
         for r in event.get("Records", []):
             bucket = r["s3"]["bucket"]["name"]
@@ -192,9 +218,18 @@ def lambda_handler(event, context):
                 continue
 
             table_name = key.split("/")[-2]
-            CDCProcessorArrow(bucket, table_name).process(key)
+            result = CDCProcessorArrow(bucket, table_name).process(key)
+            if result:
+                results.append(result)
 
-        return {"statusCode": 200, "body": "success"}
+        return {
+            "statusCode": 200,
+            "body": json.dumps({
+                "message": "success",
+                "processed_tables": len(results),
+                "results": results
+            })
+        }
 
     except Exception as e:
         logger.error(str(e), exc_info=True)
