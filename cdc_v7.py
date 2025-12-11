@@ -353,10 +353,12 @@ class CDCProcessorArrow:
         
         if rows_to_add:
             # Convert list of dicts to Arrow table
+            # Ensure all columns are present, fill missing with None
             new_rows_dict = {col: [] for col in self.df.column_names}
             for row in rows_to_add:
                 for col in self.df.column_names:
-                    new_rows_dict[col].append(row[col])
+                    # Handle missing columns by adding None
+                    new_rows_dict[col].append(row.get(col, None))
             
             new_rows_table = pa.table(new_rows_dict, schema=self.df.schema)
             self.df = pa.concat_tables([self.df, new_rows_table])
