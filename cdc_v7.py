@@ -303,7 +303,13 @@ class CDCProcessorArrow:
             ins_dict = df_ins.to_pydict()
             for idx in range(df_ins.num_rows):
                 pk = ins_dict[self.pk_col][idx]
-                row = {col: ins_dict[col][idx] for col in df_ins.column_names}
+                # Build complete row with all LOAD columns, fill missing with None
+                row = {}
+                for col in self.df.column_names:
+                    if col in ins_dict:
+                        row[col] = ins_dict[col][idx]
+                    else:
+                        row[col] = None
                 final_state[pk] = ('INSERT', row)
                 inserts_applied += 1
         
@@ -312,7 +318,13 @@ class CDCProcessorArrow:
             upd_dict = df_upd.to_pydict()
             for idx in range(df_upd.num_rows):
                 pk = upd_dict[self.pk_col][idx]
-                row = {col: upd_dict[col][idx] for col in df_upd.column_names}
+                # Build complete row with all LOAD columns, fill missing with None
+                row = {}
+                for col in self.df.column_names:
+                    if col in upd_dict:
+                        row[col] = upd_dict[col][idx]
+                    else:
+                        row[col] = None
                 if pk in final_state:
                     logger.info(f"PK {pk}: UPDATE overriding previous {final_state[pk][0]}")
                 final_state[pk] = ('UPDATE', row)
