@@ -34,9 +34,6 @@ class CDCProcessorArrow:
         return "/".join(key.split("/")[:-1]) + "/"
 
     def get_processed_path(self, key, add_ts=False):
-        """
-        Ensure processed folder is under DSET*
-        """
         parts = key.split("/")
         filename = parts[-1]
 
@@ -131,28 +128,20 @@ class CDCProcessorArrow:
         logger.info(f"[CDC-COLLAPSE] input rows={cdc_tbl.num_rows}")
 
         rows = cdc_tbl.to_pylist()
-        staged = {}     # pk -> latest INSERT/UPDATE
-        deletes = []    # full-row DELETEs
+        staged = {}
+        deletes = []
 
         for r in rows:
             op = str(r[op_col]).upper()
             pk = r[self.pk_col]
 
-            if op == "I":
+            if op in ("I", "U"):
                 staged[pk] = r
-                logger.info(f"[CDC-COLLAPSE] INSERT staged pk={pk}")
-
-            elif op == "U":
-                staged[pk] = r
-                logger.info(f"[CDC-COLLAPSE] UPDATE overwrote pk={pk}")
-
             elif op == "D":
                 if pk in staged:
                     del staged[pk]
-                    logger.info(f"[CDC-COLLAPSE] DELETE removed staged pk={pk}")
                 else:
                     deletes.append(r)
-                    logger.info("[CDC-COLLAPSE] DELETE retained (full row)")
 
         final_rows = list(staged.values()) + deletes
         logger.info(f"[CDC-COLLAPSE] output rows={len(final_rows)}")
@@ -215,58 +204,53 @@ class CDCProcessorArrow:
         )
 
         # ----------------------------
-        # APPLY DELETE (FULL ROW MATCH)
+        # APPLY DELETE (FULL ROW)
         # ----------------------------
         if df_del.num_rows > 0:
-            col_order = self.df.column_names
+            cols = self.df.column_names
 
-            def row_tuple(row):
-                return tuple(row[c] for c in col_order)
+            def row_tuple(r):
+                return tuple(r[c] for c in cols)
 
             delete_set = {row_tuple(r) for r in df_del.to_pylist()}
             before = self.df.num_rows
 
-            keep_idx = [
-                i
-                for i, r in enumerate(self.df.to_pylist())
+            keep = [
+                i for i, r in enumerate(self.df.to_pylist())
                 if row_tuple(r) not in delete_set
             ]
 
-            self.df = (
-                self.df.take(keep_idx)
-                if keep_idx
-                else self.df.slice(0, 0)
-            )
-
-            logger.info(
-                f"[APPLY] DELETE removed={before - self.df.num_rows}"
-            )
+            self.df = self.df.take(keep) if keep else self.df.slice(0, 0)
+            logger.info(f"[APPLY] DELETE removed={before - self.df.num_rows}")
 
         # ----------------------------
-        # APPLY UPDATE (PK ONLY)
+        # APPLY UPDATE (SAFE, NO DELETE)
         # ----------------------------
         if df_upd.num_rows > 0:
-            upd_keys = set(df_upd[self.pk_col].to_pylist())
-            before = self.df.num_rows
+            upd_map = {
+                r[self.pk_col]: r
+                for r in df_upd.to_pylist()
+            }
 
-            keep_idx = [
-                i
-                for i, pk in enumerate(self.df[self.pk_col].to_pylist())
-                if pk not in upd_keys
-            ]
+            new_rows = []
+            replaced = 0
 
-            self.df = (
-                self.df.take(keep_idx)
-                if keep_idx
-                else self.df.slice(0, 0)
-            )
+            for r in self.df.to_pylist():
+                pk = r[self.pk_col]
+                if pk in upd_map:
+                    new_rows.append(upd_map[pk])
+                    replaced += 1
+                    del upd_map[pk]
+                else:
+                    new_rows.append(r)
 
-            self.df = pa.concat_tables([self.df, df_upd])
+            # upsert new keys
+            if upd_map:
+                new_rows.extend(upd_map.values())
+                logger.info(f"[APPLY] UPDATE upserted={len(upd_map)}")
 
-            logger.info(
-                f"[APPLY] UPDATE replaced={before - len(keep_idx)}, "
-                f"added={df_upd.num_rows}"
-            )
+            self.df = pa.Table.from_pylist(new_rows, schema=self.df.schema)
+            logger.info(f"[APPLY] UPDATE replaced={replaced}")
 
         # ----------------------------
         # APPLY INSERT
@@ -307,7 +291,6 @@ def lambda_handler(event, context):
         key = r["s3"]["object"]["key"]
 
         if "/processed/" in key or "LOAD" in key:
-            logger.info(f"[SKIP] {key}")
             continue
 
         table = key.split("/")[-2]
