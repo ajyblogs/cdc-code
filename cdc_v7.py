@@ -25,13 +25,15 @@ class CDCProcessorArrow:
     # ------------------------
     def read_arrow(self, key):
         obj = s3.get_object(Bucket=self.bucket, Key=key)
-        return csv.read_csv(obj["Body"], parse_options=csv.ParseOptions(delimiter="|"))
+        tbl = csv.read_csv(obj["Body"], parse_options=csv.ParseOptions(delimiter="|"))
+        logger.info(f"[READ] {key} rows={tbl.num_rows}")
+        return tbl
 
     def write_arrow(self, key, table):
         buf = BytesIO()
         csv.write_csv(table, buf, write_options=csv.WriteOptions(delimiter="|"))
         s3.put_object(Bucket=self.bucket, Key=key, Body=buf.getvalue())
-        logger.info(f"[WRITE] LOAD rows={table.num_rows}")
+        logger.info(f"[WRITE] {key} rows={table.num_rows}")
 
     def move_file(self, src, dst):
         s3.copy_object(Bucket=self.bucket, CopySource={"Bucket": self.bucket, "Key": src}, Key=dst)
@@ -61,6 +63,7 @@ class CDCProcessorArrow:
                 if k.endswith(".csv") and "LOAD" not in k and "/processed/" not in k:
                     files.append(k)
         files.sort()
+        logger.info(f"[DISCOVER] CDC files={files}")
         return files
 
     # ------------------------
@@ -98,25 +101,28 @@ class CDCProcessorArrow:
         return pa.Table.from_arrays(arrays, names=[op_col]+[f.name for f in target_schema])
 
     # ------------------------
-    # Vectorised DELETE (full-row match)
+    # Vectorised DELETE (full-row match, ChunkedArray safe)
     # ------------------------
     def apply_delete(self, df_del):
         if df_del.num_rows == 0:
             return
         mask = pa.array([True] * self.df.num_rows)
         for col in self.df.column_names:
-            mask = pc.and_(mask, ~pc.is_in(self.df[col], df_del[col]))
+            df_col = pa.chunked_array(self.df[col])
+            del_col = pa.chunked_array(df_del[col])
+            col_mask = pc.invert(pc.is_in(df_col, del_col))
+            mask = pc.and_(mask, col_mask)
         self.df = self.df.filter(mask)
         logger.info(f"[DELETE] applied, LOAD rows={self.df.num_rows}")
 
     # ------------------------
-    # Vectorised UPDATE (PK-based)
+    # Vectorised UPDATE (PK-based, ChunkedArray safe)
     # ------------------------
     def apply_update(self, df_upd):
         if df_upd.num_rows == 0:
             return
-        pk_values = df_upd[self.pk_col]
-        mask = ~pc.is_in(self.df[self.pk_col], pk_values)
+        pk_values = pa.chunked_array(df_upd[self.pk_col])
+        mask = pc.invert(pc.is_in(pa.chunked_array(self.df[self.pk_col]), pk_values))
         remaining = self.df.filter(mask)
         self.df = pa.concat_tables([remaining, df_upd])
         logger.info(f"[UPDATE] applied, LOAD rows={self.df.num_rows}")
@@ -149,14 +155,14 @@ class CDCProcessorArrow:
             logger.info("[SKIP] no CDC files")
             return
 
-        # Sample first few CDC files for schema inference (max 5)
+        # Sample first 5 CDC files for schema inference
         sample_cdc = [self.read_arrow(f) for f in cdc_files[:5]]
         inferred_schema = self.infer_load_schema(self.df, sample_cdc)
         if inferred_schema != self.df.schema:
             self.df = self.df.cast(inferred_schema)
             logger.info("[SCHEMA] LOAD schema upgraded from CDC inference")
 
-        # Detect operation column
+        # Operation column
         op_col = sample_cdc[0].column_names[0]
         total_ins = total_upd = total_del = 0
 
@@ -174,10 +180,12 @@ class CDCProcessorArrow:
             total_upd += df_upd.num_rows
             total_del += df_del.num_rows
 
+            # Apply operations
             self.apply_delete(df_del)
             self.apply_update(df_upd)
             self.apply_insert(df_ins)
 
+            # Archive CDC file
             self.move_file(f, self.get_processed_path(f))
 
         # Archive old LOAD
