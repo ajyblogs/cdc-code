@@ -13,13 +13,21 @@ s3 = boto3.client("s3")
 
 
 class CDCProcessorArrow:
-    def __init__(self, bucket, table):
+    def __init__(self, bucket, table, update_key_columns=None):
+        """
+        bucket: S3 bucket name
+        table: Table name
+        update_key_columns: List of column names used for partial matching in UPDATEs
+                           If None, will use first column as key
+        """
         self.bucket = bucket
         self.table = table
         self.df: pa.Table | None = None
-        self.pk_col = None
+        self.update_key_columns = update_key_columns
 
         logger.info(f"CDC Processor initialized for bucket={bucket}, table={table}")
+        if update_key_columns:
+            logger.info(f"Update key columns: {update_key_columns}")
 
     # -------------------------------------------------
     # Helper functions
@@ -182,38 +190,170 @@ class CDCProcessorArrow:
             return arr
 
     # -------------------------------------------------
-    # NEW: CDC Compaction - Keep only final state per PK
+    # Create composite key for matching
     # -------------------------------------------------
-    def compact_cdc_operations(self, cdc_combined, op_col_name, pk_col):
-        """
-        Compact CDC operations to keep only the final state per primary key.
-        Logic:
-        - I → U: Keep only U (last state)
-        - I → D: Skip both (net zero change)
-        - U → U: Keep only last U
-        - U → D: Keep only D
-        - Multiple ops on same PK: Keep only the LAST operation
+    def create_composite_key(self, df, key_columns):
+        """Create a composite key by concatenating specified columns"""
+        if not key_columns:
+            return None
         
-        Returns: (final_inserts, final_updates, final_deletes) as PyArrow tables
+        # Convert all key columns to string and concatenate with separator
+        key_parts = [df[col].astype(str) for col in key_columns]
+        return key_parts[0].str.cat(key_parts[1:], sep='|~|') if len(key_parts) > 1 else key_parts[0]
+
+    def create_full_row_key(self, df):
+        """Create a key from all columns for exact matching"""
+        # Concatenate all columns
+        all_cols = df.columns.tolist()
+        key_parts = [df[col].astype(str).fillna('__NULL__') for col in all_cols]
+        return key_parts[0].str.cat(key_parts[1:], sep='|~|') if len(key_parts) > 1 else key_parts[0]
+
+    # -------------------------------------------------
+    # NEW: CDC Compaction with partial/full matching
+    # -------------------------------------------------
+    def compact_cdc_operations(self, cdc_combined, op_col_name, data_columns):
+        """
+        Compact CDC operations based on matching rules:
+        - INSERT: No matching, just keep all inserts
+        - UPDATE: Match on update_key_columns (partial match)
+        - DELETE: Match on all columns (full match)
+        
+        Compaction rules:
+        - I → U (same key): Keep only U
+        - I → D (same full row): Skip both (net zero)
+        - U → U (same key): Keep only last U
+        - U → D (same full row): Keep only D
         """
         logger.info(f"Starting CDC compaction on {cdc_combined.num_rows} operations")
         
         # Convert to pandas for easier manipulation
         df = cdc_combined.to_pandas()
-        op_col_upper = df[op_col_name].str.upper()
+        df['_seq'] = range(len(df))
+        df['_op_upper'] = df[op_col_name].str.upper()
         
-        # Group by PK and keep only the last operation for each key
-        # This automatically handles I→U, I→D, U→U, U→D scenarios
-        df_last = df.groupby(pk_col, as_index=False).last()
+        # Split by operation type first
+        inserts = df[df['_op_upper'] == 'I'].copy()
+        updates = df[df['_op_upper'] == 'U'].copy()
+        deletes = df[df['_op_upper'] == 'D'].copy()
         
-        logger.info(f"Compaction reduced operations from {len(df)} to {len(df_last)}")
+        logger.info(f"Raw ops → I={len(inserts)}, U={len(updates)}, D={len(deletes)}")
         
-        # Split into operation types
-        op_upper = df_last[op_col_name].str.upper()
+        # Create matching keys
+        if self.update_key_columns:
+            # Partial key for updates
+            if len(inserts) > 0:
+                inserts['_update_key'] = self.create_composite_key(inserts, self.update_key_columns)
+            if len(updates) > 0:
+                updates['_update_key'] = self.create_composite_key(updates, self.update_key_columns)
         
-        df_ins = df_last[op_upper == 'I'].drop(columns=[op_col_name])
-        df_upd = df_last[op_upper == 'U'].drop(columns=[op_col_name])
-        df_del = df_last[op_upper == 'D'].drop(columns=[op_col_name])
+        # Full row key for deletes
+        if len(inserts) > 0:
+            inserts['_full_key'] = self.create_full_row_key(inserts[data_columns])
+        if len(updates) > 0:
+            updates['_full_key'] = self.create_full_row_key(updates[data_columns])
+        if len(deletes) > 0:
+            deletes['_full_key'] = self.create_full_row_key(deletes[data_columns])
+        
+        # Track what to remove
+        rows_to_remove = set()
+        final_inserts = []
+        final_updates = []
+        final_deletes = []
+        
+        # Process INSERTS
+        for idx, insert_row in inserts.iterrows():
+            removed = False
+            
+            # Check if this insert is later updated (I → U)
+            if self.update_key_columns and '_update_key' in insert_row:
+                matching_updates = updates[
+                    (updates['_update_key'] == insert_row['_update_key']) & 
+                    (updates['_seq'] > insert_row['_seq'])
+                ]
+                if len(matching_updates) > 0:
+                    # Keep only the LAST update
+                    last_update = matching_updates.loc[matching_updates['_seq'].idxmax()]
+                    final_updates.append(last_update)
+                    rows_to_remove.add(insert_row['_seq'])
+                    # Mark all these updates as processed
+                    rows_to_remove.update(matching_updates['_seq'].tolist())
+                    removed = True
+                    logger.debug(f"I→U compaction: insert seq={insert_row['_seq']} replaced by update seq={last_update['_seq']}")
+            
+            # Check if this insert is later deleted (I → D)
+            if not removed and '_full_key' in insert_row:
+                matching_deletes = deletes[
+                    (deletes['_full_key'] == insert_row['_full_key']) & 
+                    (deletes['_seq'] > insert_row['_seq'])
+                ]
+                if len(matching_deletes) > 0:
+                    # Net zero change - remove both insert and delete
+                    rows_to_remove.add(insert_row['_seq'])
+                    rows_to_remove.update(matching_deletes['_seq'].tolist())
+                    removed = True
+                    logger.debug(f"I→D compaction: insert seq={insert_row['_seq']} cancelled by delete")
+            
+            # If not removed, keep the insert
+            if not removed:
+                final_inserts.append(insert_row)
+        
+        # Process UPDATES (that weren't already handled by I→U)
+        for idx, update_row in updates.iterrows():
+            if update_row['_seq'] in rows_to_remove:
+                continue
+            
+            removed = False
+            
+            # Check if this update is later updated (U → U)
+            if self.update_key_columns and '_update_key' in update_row:
+                matching_updates = updates[
+                    (updates['_update_key'] == update_row['_update_key']) & 
+                    (updates['_seq'] > update_row['_seq']) &
+                    (~updates['_seq'].isin(rows_to_remove))
+                ]
+                if len(matching_updates) > 0:
+                    # This update is superseded by a later one
+                    rows_to_remove.add(update_row['_seq'])
+                    removed = True
+                    continue
+            
+            # Check if this update is later deleted (U → D)
+            if not removed and '_full_key' in update_row:
+                matching_deletes = deletes[
+                    (deletes['_full_key'] == update_row['_full_key']) & 
+                    (deletes['_seq'] > update_row['_seq'])
+                ]
+                if len(matching_deletes) > 0:
+                    # Keep only the delete
+                    last_delete = matching_deletes.loc[matching_deletes['_seq'].idxmax()]
+                    final_deletes.append(last_delete)
+                    rows_to_remove.add(update_row['_seq'])
+                    rows_to_remove.update(matching_deletes['_seq'].tolist())
+                    removed = True
+                    logger.debug(f"U→D compaction: update seq={update_row['_seq']} replaced by delete seq={last_delete['_seq']}")
+            
+            # If not removed, keep the update
+            if not removed:
+                final_updates.append(update_row)
+        
+        # Process DELETES (that weren't already handled)
+        for idx, delete_row in deletes.iterrows():
+            if delete_row['_seq'] not in rows_to_remove:
+                final_deletes.append(delete_row)
+        
+        # Convert back to DataFrames
+        df_ins = inserts.loc[[r['_seq'] for r in final_inserts]] if final_inserts else inserts.iloc[0:0]
+        df_upd = updates.loc[[r['_seq'] for r in final_updates]] if final_updates else updates.iloc[0:0]
+        df_del = deletes.loc[[r['_seq'] for r in final_deletes]] if final_deletes else deletes.iloc[0:0]
+        
+        # Clean up helper columns
+        for df_temp in [df_ins, df_upd, df_del]:
+            cols_to_drop = [c for c in ['_seq', '_op_upper', '_update_key', '_full_key'] if c in df_temp.columns]
+            df_temp.drop(columns=cols_to_drop, inplace=True)
+            df_temp.drop(columns=[op_col_name], inplace=True, errors='ignore')
+        
+        logger.info(f"Compaction: {len(df)} → {len(df_ins) + len(df_upd) + len(df_del)} operations")
+        logger.info(f"Compacted CDC → INSERT={len(df_ins)}, UPDATE={len(df_upd)}, DELETE={len(df_del)}")
         
         # Convert back to PyArrow tables
         schema_without_op = pa.schema([f for f in cdc_combined.schema if f.name != op_col_name])
@@ -222,9 +362,76 @@ class CDCProcessorArrow:
         tbl_upd = pa.Table.from_pandas(df_upd, schema=schema_without_op, preserve_index=False) if not df_upd.empty else pa.table({}, schema=schema_without_op)
         tbl_del = pa.Table.from_pandas(df_del, schema=schema_without_op, preserve_index=False) if not df_del.empty else pa.table({}, schema=schema_without_op)
         
-        logger.info(f"Compacted CDC → INSERT={tbl_ins.num_rows}, UPDATE={tbl_upd.num_rows}, DELETE={tbl_del.num_rows}")
-        
         return tbl_ins, tbl_upd, tbl_del
+
+    # -------------------------------------------------
+    # Apply UPDATE using partial key matching
+    # -------------------------------------------------
+    def apply_updates(self, load_df, update_df):
+        """Apply updates by matching on update_key_columns (partial match)"""
+        if update_df.num_rows == 0:
+            return load_df
+        
+        if not self.update_key_columns:
+            logger.warning("No update key columns specified, using first column")
+            self.update_key_columns = [load_df.column_names[0]]
+        
+        logger.info(f"Applying {update_df.num_rows} updates using key columns: {self.update_key_columns}")
+        
+        # Convert to pandas for easier manipulation
+        df_load = load_df.to_pandas()
+        df_upd = update_df.to_pandas()
+        
+        # Create composite keys
+        load_key = self.create_composite_key(df_load, self.update_key_columns)
+        upd_key = self.create_composite_key(df_upd, self.update_key_columns)
+        
+        df_load['_match_key'] = load_key
+        df_upd['_match_key'] = upd_key
+        
+        # Remove rows that will be updated
+        upd_keys = set(df_upd['_match_key'].unique())
+        df_remaining = df_load[~df_load['_match_key'].isin(upd_keys)].drop(columns=['_match_key'])
+        
+        # Add updated rows
+        df_upd_clean = df_upd.drop(columns=['_match_key'])
+        df_result = pd.concat([df_remaining, df_upd_clean], ignore_index=True)
+        
+        logger.info(f"Updates applied: {len(df_load)} → {len(df_result)} rows")
+        
+        # Convert back to PyArrow
+        return pa.Table.from_pandas(df_result, schema=load_df.schema, preserve_index=False)
+
+    # -------------------------------------------------
+    # Apply DELETE using full row matching
+    # -------------------------------------------------
+    def apply_deletes(self, load_df, delete_df):
+        """Apply deletes by matching on ALL columns (exact match)"""
+        if delete_df.num_rows == 0:
+            return load_df
+        
+        logger.info(f"Applying {delete_df.num_rows} deletes using full row match")
+        
+        # Convert to pandas
+        df_load = load_df.to_pandas()
+        df_del = delete_df.to_pandas()
+        
+        # Create full row keys
+        all_cols = df_load.columns.tolist()
+        load_key = self.create_full_row_key(df_load)
+        del_key = self.create_full_row_key(df_del)
+        
+        df_load['_full_key'] = load_key
+        df_del['_full_key'] = del_key
+        
+        # Remove matching rows
+        del_keys = set(df_del['_full_key'].unique())
+        df_result = df_load[~df_load['_full_key'].isin(del_keys)].drop(columns=['_full_key'])
+        
+        logger.info(f"Deletes applied: {len(df_load)} → {len(df_result)} rows")
+        
+        # Convert back to PyArrow
+        return pa.Table.from_pandas(df_result, schema=load_df.schema, preserve_index=False)
 
     # -------------------------------------------------
     # Main CDC Processor
@@ -240,8 +447,12 @@ class CDCProcessorArrow:
         # LOAD base dataset
         self.df = self.load_arrow_table(load_file)
         initial_rows = self.df.num_rows
-        self.pk_col = self.df.column_names[0]
-        logger.info(f"Primary key column: {self.pk_col}")
+        
+        # Set update key columns to first column if not specified
+        if not self.update_key_columns:
+            self.update_key_columns = [self.df.column_names[0]]
+        
+        logger.info(f"Update key columns: {self.update_key_columns}")
 
         # Discover CDC files
         cdc_files = self.list_cdc_files(prefix)
@@ -286,59 +497,23 @@ class CDCProcessorArrow:
         op_arr_upper = self.safe_upper(cdc_combined[op_col_name])
         cdc_combined = cdc_combined.set_column(0, op_col_name, op_arr_upper)
         
-        # **NEW: Compact CDC operations - keep only final state per PK**
-        df_ins, df_upd, df_del = self.compact_cdc_operations(cdc_combined, op_col_name, self.pk_col)
+        # Get data columns (all except operation column)
+        data_columns = [col for col in cdc_combined.column_names if col != op_col_name]
+        
+        # **Compact CDC operations with partial/full matching**
+        df_ins, df_upd, df_del = self.compact_cdc_operations(cdc_combined, op_col_name, data_columns)
 
         # -------------------------------------------------
-        # DELETE
+        # Apply operations in order: DELETE → UPDATE → INSERT
         # -------------------------------------------------
-        if df_del.num_rows > 0:
-            del_pk_list = df_del[self.pk_col].to_pylist()
-            del_pk_set = set(del_pk_list)
-            logger.info(f"DELETE: processing {len(del_pk_set)} unique keys")
-            
-            # Filter out deleted rows
-            current_pks = self.df[self.pk_col].to_pylist()
-            keep_mask = [pk not in del_pk_set for pk in current_pks]
-            keep_indices = [i for i, keep in enumerate(keep_mask) if keep]
-            
-            before = self.df.num_rows
-            if keep_indices:
-                self.df = self.df.take(keep_indices)
-            else:
-                # All rows deleted, create empty table with same schema
-                self.df = pa.table({col: pa.array([], type=self.df.schema.field(col).type) 
-                                   for col in self.df.column_names})
-            logger.info(f"DELETE removed rows: {before - self.df.num_rows}")
-
-        # -------------------------------------------------
-        # UPDATE
-        # -------------------------------------------------
-        if df_upd.num_rows > 0:
-            upd_pk_list = df_upd[self.pk_col].to_pylist()
-            upd_pk_set = set(upd_pk_list)
-            logger.info(f"UPDATE: processing {len(upd_pk_set)} unique keys")
-            
-            # Filter out rows to be updated
-            current_pks = self.df[self.pk_col].to_pylist()
-            keep_mask = [pk not in upd_pk_set for pk in current_pks]
-            keep_indices = [i for i, keep in enumerate(keep_mask) if keep]
-            
-            before = self.df.num_rows
-            if keep_indices:
-                self.df = self.df.take(keep_indices)
-            else:
-                # All rows updated, create empty table
-                self.df = pa.table({col: pa.array([], type=self.df.schema.field(col).type) 
-                                   for col in self.df.column_names})
-            logger.info(f"UPDATE removed old rows: {before - self.df.num_rows}")
-
-            self.df = pa.concat_tables([self.df, df_upd])
-            logger.info(f"UPDATE inserted new rows: {df_upd.num_rows}")
-
-        # -------------------------------------------------
-        # INSERT
-        # -------------------------------------------------
+        
+        # DELETE (full row match)
+        self.df = self.apply_deletes(self.df, df_del)
+        
+        # UPDATE (partial key match)
+        self.df = self.apply_updates(self.df, df_upd)
+        
+        # INSERT (just append)
         if df_ins.num_rows > 0:
             self.df = pa.concat_tables([self.df, df_ins])
             logger.info(f"INSERT rows added: {df_ins.num_rows}")
@@ -386,7 +561,13 @@ def lambda_handler(event, context):
                 continue
 
             table_name = key.split("/")[-2]
-            proc = CDCProcessorArrow(bucket, table_name)
+            
+            # Define which columns to use for UPDATE matching
+            # Adjust this based on your table structure
+            update_key_columns = None  # Will default to first column
+            # Example: update_key_columns = ['id', 'customer_code']
+            
+            proc = CDCProcessorArrow(bucket, table_name, update_key_columns)
             proc.process(key)
 
         return {"statusCode": 200, "body": json.dumps({"status": "success"})}
