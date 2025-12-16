@@ -37,12 +37,20 @@ class CDCProcessorArrow:
     def get_processed_path(self, key, add_ts=False):
         parts = key.split("/")
         fname = parts[-1]
-
         if add_ts:
             ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-            fname = fname.replace(".csv", f"_{ts}.csv")
-
-        return "/".join(parts[:-1] + ["processed", fname])
+            filename = filename.replace(".csv", f"_{ts}.csv")
+    
+        for i, p in enumerate(parts):
+            if p.upper().startswith("DSET"):
+                return "/".join(
+                    parts[: i + 1] +
+                    ["processed"] +
+                    parts[i + 1 : -1] +
+                    [filename]
+                )
+    
+        raise ValueError(f"DSET folder not found in path: {key}")
 
     def move_file(self, src, dst):
         s3.copy_object(
