@@ -25,9 +25,7 @@ class CDCProcessorArrow:
     # ------------------------
     def read_arrow(self, key):
         obj = s3.get_object(Bucket=self.bucket, Key=key)
-        tbl = csv.read_csv(obj["Body"], parse_options=csv.ParseOptions(delimiter="|"))
-        logger.info(f"[READ] {key} rows={tbl.num_rows}")
-        return tbl
+        return csv.read_csv(obj["Body"], parse_options=csv.ParseOptions(delimiter="|"))
 
     def write_arrow(self, key, table):
         buf = BytesIO()
@@ -63,7 +61,6 @@ class CDCProcessorArrow:
                 if k.endswith(".csv") and "LOAD" not in k and "/processed/" not in k:
                     files.append(k)
         files.sort()
-        logger.info(f"[DISCOVER] CDC files={files}")
         return files
 
     # ------------------------
@@ -82,76 +79,69 @@ class CDCProcessorArrow:
         return pa.Table.from_arrays(arrays, names=[op_col]+[f.name for f in target_schema])
 
     # ------------------------
-    # APPLY DELETE (full-row)
+    # Vectorised DELETE (full-row match)
     # ------------------------
     def apply_delete(self, df_del):
         if df_del.num_rows == 0:
             return
-        cols = self.df.column_names
-        del_rows = {tuple(r.values()) for r in df_del.to_pylist()}
-        kept_rows = [r for r in self.df.to_pylist() if tuple(r.values()) not in del_rows]
-        removed = self.df.num_rows - len(kept_rows)
-        self.df = pa.Table.from_pylist(kept_rows, schema=self.df.schema)
-        logger.info(f"[DELETE] removed={removed}")
+        mask = pa.array([True] * self.df.num_rows)
+        for col in self.df.column_names:
+            del_col = df_del[col]
+            df_col = self.df[col]
+            col_mask = ~pc.is_in(df_col, del_col)
+            mask = pc.and_(mask, col_mask)
+        self.df = self.df.filter(mask)
+        logger.info(f"[DELETE] applied, remaining LOAD rows={self.df.num_rows}")
 
     # ------------------------
-    # APPLY UPDATE (PK-based safe replace)
+    # Vectorised UPDATE (PK-based)
     # ------------------------
     def apply_update(self, df_upd):
         if df_upd.num_rows == 0:
             return
-        upd_map = {r[self.pk_col]: r for r in df_upd.to_pylist()}
-        new_rows = []
-        replaced = 0
-        for r in self.df.to_pylist():
-            pk = r[self.pk_col]
-            if pk in upd_map:
-                new_rows.append(upd_map.pop(pk))
-                replaced += 1
-            else:
-                new_rows.append(r)
-        if upd_map:
-            new_rows.extend(upd_map.values())
-        self.df = pa.Table.from_pylist(new_rows, schema=self.df.schema)
-        logger.info(f"[UPDATE] replaced={replaced}, upserted={len(upd_map)}")
+        pk_values = df_upd[self.pk_col]
+        # Identify rows to replace in LOAD
+        mask = ~pc.is_in(self.df[self.pk_col], pk_values)
+        remaining = self.df.filter(mask)
+        # Append updated rows
+        self.df = pa.concat_tables([remaining, df_upd])
+        logger.info(f"[UPDATE] applied, LOAD rows={self.df.num_rows}")
 
     # ------------------------
-    # APPLY INSERT (append)
+    # Vectorised INSERT
     # ------------------------
     def apply_insert(self, df_ins):
         if df_ins.num_rows == 0:
             return
         self.df = pa.concat_tables([self.df, df_ins])
-        logger.info(f"[INSERT] added={df_ins.num_rows}")
+        logger.info(f"[INSERT] applied, LOAD rows={self.df.num_rows}")
 
     # ------------------------
-    # MAIN PROCESS
+    # Main CDC processor
     # ------------------------
     def process(self, trigger_key):
         prefix = self.get_prefix(trigger_key)
         load_key = f"{prefix}LOAD00000001.csv"
 
-        # LOAD
+        # Load base table
         self.df = self.read_arrow(load_key)
         self.pk_col = self.df.column_names[0]
         initial_rows = self.df.num_rows
-        logger.info(f"[LOAD] rows={initial_rows}")
+        logger.info(f"[LOAD] initial rows={initial_rows}")
 
-        # CDC files
+        # Process CDC files one by one
         cdc_files = self.list_cdc_files(prefix)
         if not cdc_files:
             logger.info("[SKIP] no CDC files")
             return
 
         op_col = self.read_arrow(cdc_files[0]).column_names[0]
-
-        # Process each CDC file sequentially to save memory
         total_ins = total_upd = total_del = 0
+
         for f in cdc_files:
             cdc_tbl = self.read_arrow(f)
             aligned = self.align_schema(cdc_tbl, self.df.schema, op_col)
 
-            # Separate ops
             ops = pc.utf8_upper(pc.cast(aligned[op_col], pa.string()))
             df_ins = aligned.filter(pc.equal(ops, "I")).remove_column(0)
             df_upd = aligned.filter(pc.equal(ops, "U")).remove_column(0)
@@ -161,35 +151,33 @@ class CDCProcessorArrow:
             total_upd += df_upd.num_rows
             total_del += df_del.num_rows
 
-            # Apply
             self.apply_delete(df_del)
             self.apply_update(df_upd)
             self.apply_insert(df_ins)
 
-            # Archive processed CDC
             self.move_file(f, self.get_processed_path(f))
 
         # Archive old LOAD
         self.move_file(load_key, self.get_processed_path(load_key, add_ts=True))
-
-        # Write updated LOAD
         self.write_arrow(load_key, self.df)
 
         final_rows = self.df.num_rows
         logger.info(f"[STATS] INSERT={total_ins}, UPDATE={total_upd}, DELETE={total_del}, FINAL_LOAD={final_rows}, net_change={final_rows-initial_rows:+d}")
 
 
-# ----------------------------
+# ------------------------
 # Lambda handler
-# ----------------------------
+# ------------------------
 def lambda_handler(event, context):
     logger.info(json.dumps(event))
 
     for r in event.get("Records", []):
         bucket = r["s3"]["bucket"]["name"]
         key = r["s3"]["object"]["key"]
+
         if "LOAD" in key or "/processed/" in key:
             continue
+
         table = key.split("/")[-2]
         CDCProcessorArrow(bucket, table).process(key)
 
