@@ -155,6 +155,47 @@ class CDCProcessorArrow:
                 self.insert_count += 1
 
         return base
+        # -------------------------------------------------
+        # Collapse CDC rows inside a single CDC file
+        # INSERT followed by UPDATE → keep UPDATE only
+        # -------------------------------------------------
+        def collapse_cdc_file(self, cdc_tbl, op_col):
+            """
+            Keeps only the last operation per record within the CDC file.
+            Record identity = all columns except op_col.
+            """
+            records = {}
+            order = []
+    
+            for i in range(cdc_tbl.num_rows):
+                row = cdc_tbl.slice(i, 1)
+                data = row.remove_column(0)  # remove op column
+                key = tuple(data[col][0].as_py() for col in data.column_names)
+    
+                op = str(row[op_col][0].as_py()).upper()
+    
+                # overwrite previous operation for same record
+                if key not in records:
+                    order.append(key)
+    
+                records[key] = (op, data)
+    
+            # rebuild CDC table in original order
+            ops = []
+            rows = []
+    
+            for k in order:
+                op, data = records[k]
+                ops.append(pa.array([op]))
+                rows.append(data)
+    
+            return pa.Table.from_arrays(
+                [pa.concat_arrays(ops)] + [
+                    pa.concat_arrays([r[col] for r in rows])
+                    for col in rows[0].column_names
+                ],
+                names=[op_col] + rows[0].column_names
+            )
 
     # -------------------------------------------------
     # Main Processor
@@ -180,8 +221,8 @@ class CDCProcessorArrow:
             logger.info(f"Processing CDC file: {f}")
             raw = self.load_arrow_table(f)
             aligned = self.align_schema(raw, schema, op_col)
-
-            self.df = self.apply_cdc(self.df, aligned, op_col)
+            collapsed = self.collapse_cdc_file(aligned, op_col)            
+            self.df = self.apply_cdc(self.df, collapsed, op_col)
             self.move_file(f, self.get_processed_path(f))
 
         self.move_file(load_key, self.get_processed_path(load_key, True))
