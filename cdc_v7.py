@@ -36,7 +36,7 @@ class CDCProcessorArrow:
 
     def get_processed_path(self, key, add_ts=False):
         parts = key.split("/")
-        fname = parts[-1]
+        filename = parts[-1]
         if add_ts:
             ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
             filename = filename.replace(".csv", f"_{ts}.csv")
