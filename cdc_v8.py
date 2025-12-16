@@ -119,6 +119,23 @@ class CDCProcessorArrow:
         return base.filter(to_keep)
 
     # -------------------------------------------------
+    # DELETE matching rows across partial columns
+    # -------------------------------------------------
+    def delete_partial_matching_rows(self, base, row):
+        mask = pa.scalar(True)
+        for col in base.column_names:
+            val = row[col][0].as_py()
+            if val is not None:
+                mask = pc.and_(
+                    mask,
+                    pc.equal(base[col], pa.scalar(val))
+                )
+        to_keep = pc.invert(mask)
+        deleted = pc.sum(pc.cast(mask, pa.int64())).as_py()
+    
+        return base.filter(to_keep), deleted
+
+    # -------------------------------------------------
     # Main CDC Application (Order Preserving)
     # -------------------------------------------------
     def apply_cdc(self, base, cdc, op_col):
@@ -128,9 +145,10 @@ class CDCProcessorArrow:
 
             if op == "D":
                 base = self.delete_matching_rows(base, row)
+                self.delete_count += 1
 
             elif op == "U":
-                base = self.delete_matching_rows(base, row)
+                base, deleted = self.delete_partial_matching_rows(base, row)
                 base = pa.concat_tables([base, row])
                 self.update_count += 1
 
