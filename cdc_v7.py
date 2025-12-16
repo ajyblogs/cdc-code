@@ -226,29 +226,26 @@ class CDCProcessorArrow:
             logger.info(f"[APPLY] DELETE applied")
 
         # --------------------------------------------------
-        # APPLY UPDATE (PK ONLY, replace in LOAD)
+        # APPLY UPDATE (PK ONLY)
         # --------------------------------------------------
         if df_upd.num_rows > 0:
-            # Map PK -> row from CDC
-            upd_map = {r[self.pk_col]: r for r in df_upd.to_pylist()}
-        
-            # Replace rows in LOAD where PK matches
-            new_rows = []
-            for r in self.df.to_pylist():
-                pk = r[self.pk_col]
-                if pk in upd_map:
-                    new_rows.append(upd_map[pk])  # replace with CDC row
-                else:
-                    new_rows.append(r)  # keep original
-        
-            # Add any new PKs in CDC that are not in LOAD
-            existing_pks = set(r[self.pk_col] for r in self.df.to_pylist())
-            for pk, row in upd_map.items():
-                if pk not in existing_pks:
-                    new_rows.append(row)
-        
-            self.df = pa.Table.from_pylist(new_rows, schema=self.df.schema)
+            upd_keys = set(df_upd[self.pk_col].to_pylist())
+
+            keep_idx = [
+                i
+                for i, pk in enumerate(self.df[self.pk_col].to_pylist())
+                if pk not in upd_keys
+            ]
+
+            self.df = (
+                self.df.take(keep_idx)
+                if keep_idx
+                else self.df.slice(0, 0)
+            )
+
+            self.df = pa.concat_tables([self.df, df_upd])
             logger.info(f"[APPLY] UPDATE applied")
+
         # --------------------------------------------------
         # APPLY INSERT
         # --------------------------------------------------
