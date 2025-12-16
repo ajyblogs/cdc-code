@@ -131,7 +131,7 @@ class CDCProcessorArrow:
         to_keep = pc.invert(mask)
         deleted = pc.sum(pc.cast(mask, pa.int64())).as_py()
     
-        return base.filter(to_keep), deleted
+        return base.filter(to_keep)
 
     # -------------------------------------------------
     # Main CDC Application (Order Preserving)
