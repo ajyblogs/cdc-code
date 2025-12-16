@@ -225,9 +225,9 @@ class CDCProcessorArrow:
 
             logger.info(f"[APPLY] DELETE applied")
 
-       # --------------------------------------------------
-       # APPLY UPDATE (PK ONLY, replace in LOAD)
-       # --------------------------------------------------
+        # --------------------------------------------------
+        # APPLY UPDATE (PK ONLY, replace in LOAD)
+        # --------------------------------------------------
         if df_upd.num_rows > 0:
             # Map PK -> row from CDC
             upd_map = {r[self.pk_col]: r for r in df_upd.to_pylist()}
