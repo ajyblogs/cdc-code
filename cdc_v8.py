@@ -5,8 +5,6 @@ import pyarrow.csv as csv
 import pyarrow.compute as pc
 from datetime import datetime
 import logging
-from io import BytesIO
-import hashlib
 
 # --------------------------------------------------
 # Logging
@@ -18,6 +16,9 @@ logger.setLevel(logging.INFO)
 # AWS
 # --------------------------------------------------
 s3 = boto3.client("s3")
+
+# Batch size for processing
+BATCH_SIZE = 50000
 
 
 class CDCProcessorArrow:
@@ -98,7 +99,7 @@ class CDCProcessorArrow:
     def write_arrow(self, key, table):
         buf = table.to_pandas().to_csv(index=False, sep="|").encode()
         s3.put_object(Bucket=self.bucket, Key=key, Body=buf)
-        logger.info(f"[WRITE] LOAD rows={table.num_rows}")
+        logger.info(f"[WRITE] {key} rows={table.num_rows}")
 
     # --------------------------------------------------
     # Schema alignment
@@ -123,66 +124,21 @@ class CDCProcessorArrow:
         return pa.Table.from_arrays(arrays, names=names)
 
     # --------------------------------------------------
-    # Row hashing for efficient full-row matching
-    # --------------------------------------------------
-    def hash_row(self, row_dict):
-        """Create hash of all column values for efficient comparison"""
-        # Sort keys for consistent hashing
-        sorted_items = sorted(row_dict.items())
-        # Convert to string representation, handling None
-        row_str = "|".join(
-            f"{k}:{v if v is not None else 'NULL'}" 
-            for k, v in sorted_items
-        )
-        return hashlib.md5(row_str.encode()).hexdigest()
-
-    # --------------------------------------------------
-    # CDC COLLAPSE (PK-based for I/U, full-row for D)
+    # CDC COLLAPSE - Keep only latest operation per PK
     # --------------------------------------------------
     def collapse_all_cdc(self, cdc_tbl, op_col):
         logger.info(f"[CDC-COLLAPSE] Start rows={cdc_tbl.num_rows}")
 
-        rows = cdc_tbl.to_pylist()
-
-        staged = {}           # pk_value -> row (INSERT / UPDATE)
-        delete_hashes = set() # hashes of full rows to DELETE
-
-        for r in rows:
-            op = str(r[op_col]).upper()
-            pk_val = r[self.pk_col]
-
-            if op == "I":
-                staged[pk_val] = r
-
-            elif op == "U":
-                staged[pk_val] = r
-
-            elif op == "D":
-                if pk_val in staged:
-                    del staged[pk_val]
-                else:
-                    # Store hash of full row for deletion
-                    row_copy = {k: v for k, v in r.items() if k != op_col}
-                    delete_hashes.add(self.hash_row(row_copy))
-
-        logger.info(
-            f"[CDC-COLLAPSE] staged={len(staged)}, delete_hashes={len(delete_hashes)}"
-        )
-
-        # Build final collapsed table
-        final_rows = []
-        for pk_val, row in staged.items():
-            row[op_col] = 'I' if row[op_col].upper() == 'I' else 'U'
-            final_rows.append(row)
+        # Convert to pandas for groupby (faster than Python loop)
+        df = cdc_tbl.to_pandas()
         
-        # Add one representative delete row (we'll use hashes for actual matching)
-        if delete_hashes:
-            final_rows.append({
-                op_col: 'D',
-                **{col: None for col in cdc_tbl.column_names if col != op_col}
-            })
-
-        return pa.Table.from_pylist(final_rows, schema=cdc_tbl.schema), delete_hashes
+        # Keep last operation per PK
+        df_collapsed = df.groupby(self.pk_col, as_index=False).last()
+        
+        result = pa.Table.from_pandas(df_collapsed, schema=cdc_tbl.schema)
+        
+        logger.info(f"[CDC-COLLAPSE] Collapsed to {result.num_rows} rows")
+        return result
 
     # --------------------------------------------------
     # MAIN PROCESS
@@ -195,7 +151,7 @@ class CDCProcessorArrow:
         logger.info(f"[LOAD] Reading {load_key}")
         self.df = self.read_arrow(load_key)
         self.pk_col = self.df.column_names[0]
-        logger.info(f"[LOAD] PK column: {self.pk_col}, rows={self.df.num_rows}")
+        logger.info(f"[LOAD] PK={self.pk_col}, rows={self.df.num_rows}")
 
         # CDC files
         cdc_files = self.list_cdc_files(prefix)
@@ -207,132 +163,123 @@ class CDCProcessorArrow:
         first = self.read_arrow(cdc_files[0])
         op_col = first.column_names[0]
 
-        logger.info(f"[CDC] Aligning {len(cdc_files)} files")
+        logger.info(f"[CDC] Processing {len(cdc_files)} files")
         aligned = []
         for f in cdc_files:
             raw = self.read_arrow(f)
             aligned.append(self.align_schema(raw, self.df.schema, op_col))
 
         all_cdc = pa.concat_tables(aligned)
-        logger.info(f"[CDC] Total CDC rows before collapse: {all_cdc.num_rows}")
+        logger.info(f"[CDC] Total rows before collapse: {all_cdc.num_rows}")
 
         # Collapse CDC
-        collapsed, delete_hashes = self.collapse_all_cdc(all_cdc, op_col)
+        collapsed = self.collapse_all_cdc(all_cdc, op_col)
 
+        # Split by operation
         op_arr = pc.utf8_upper(pc.cast(collapsed[op_col], pa.string()))
 
         df_ins = collapsed.filter(pc.equal(op_arr, "I")).remove_column(0)
         df_upd = collapsed.filter(pc.equal(op_arr, "U")).remove_column(0)
-        has_deletes = len(delete_hashes) > 0
+        df_del = collapsed.filter(pc.equal(op_arr, "D")).remove_column(0)
 
         logger.info(
-            f"[CDC] After collapse | I={df_ins.num_rows}, "
-            f"U={df_upd.num_rows}, D={len(delete_hashes)}"
+            f"[CDC] Split | I={df_ins.num_rows}, "
+            f"U={df_upd.num_rows}, D={df_del.num_rows}"
         )
 
         # --------------------------------------------------
-        # ⭐ APPLY DELETE (FULL ROW MATCH - OPTIMIZED WITH HASHING)
+        # APPLY OPERATIONS USING PANDAS (MUCH FASTER)
         # --------------------------------------------------
-        if has_deletes:
-            logger.info(f"[APPLY] DELETE processing {len(delete_hashes)} unique row hashes")
-            
-            load_rows = self.df.to_pylist()
-            keep_rows = []
-            deleted_count = 0
-            
-            for i, row in enumerate(load_rows):
-                if i % 10000 == 0 and i > 0:
-                    logger.info(f"[APPLY] DELETE progress: {i}/{len(load_rows)}")
-                
-                row_hash = self.hash_row(row)
-                
-                if row_hash not in delete_hashes:
-                    keep_rows.append(row)
-                else:
-                    deleted_count += 1
-
-            self.df = (
-                pa.Table.from_pylist(keep_rows, schema=self.df.schema)
-                if keep_rows
-                else self.df.slice(0, 0)
-            )
-
-            logger.info(f"[APPLY] DELETE applied, deleted={deleted_count}, remaining={self.df.num_rows}")
+        
+        # Convert to pandas for efficient operations
+        load_df = self.df.to_pandas()
+        logger.info(f"[PROCESS] Converted LOAD to pandas: {len(load_df)} rows")
 
         # --------------------------------------------------
-        # ⭐ APPLY UPDATE (PARTIAL MATCH ON PK)
+        # DELETE (full row match)
+        # --------------------------------------------------
+        if df_del.num_rows > 0:
+            logger.info(f"[DELETE] Processing {df_del.num_rows} deletes")
+            del_df = df_del.to_pandas()
+            
+            # Create composite key from all columns for matching
+            load_df['_del_key'] = load_df.astype(str).apply(lambda x: '|'.join(x), axis=1)
+            del_df['_del_key'] = del_df.astype(str).apply(lambda x: '|'.join(x), axis=1)
+            
+            # Filter out rows that match delete keys
+            before = len(load_df)
+            load_df = load_df[~load_df['_del_key'].isin(del_df['_del_key'])]
+            load_df = load_df.drop(columns=['_del_key'])
+            
+            logger.info(f"[DELETE] Removed {before - len(load_df)} rows, remaining={len(load_df)}")
+
+        # --------------------------------------------------
+        # UPDATE (PK match, partial update)
         # --------------------------------------------------
         if df_upd.num_rows > 0:
-            logger.info(f"[APPLY] UPDATE processing {df_upd.num_rows} updates")
+            logger.info(f"[UPDATE] Processing {df_upd.num_rows} updates")
+            upd_df = df_upd.to_pandas()
             
-            # Create lookup map: pk_value -> updated_row
-            upd_map = {
-                row[self.pk_col]: row 
-                for row in df_upd.to_pylist()
-            }
-
-            # Update existing rows in-place by PK match
-            updated_rows = []
-            load_rows = self.df.to_pylist()
-            update_count = 0
+            # Remove rows with matching PKs from LOAD
+            before = len(load_df)
+            load_df = load_df[~load_df[self.pk_col].isin(upd_df[self.pk_col])]
+            logger.info(f"[UPDATE] Removed {before - len(load_df)} old rows")
             
-            for i, row in enumerate(load_rows):
-                if i % 10000 == 0 and i > 0:
-                    logger.info(f"[APPLY] UPDATE progress: {i}/{len(load_rows)}")
-                
-                pk_val = row[self.pk_col]
-                
-                if pk_val in upd_map:
-                    # Merge: keep existing values, overwrite with updates
-                    updated_row = row.copy()
-                    updated_row.update(upd_map[pk_val])
-                    updated_rows.append(updated_row)
-                    update_count += 1
-                else:
-                    # Keep unchanged
-                    updated_rows.append(row)
-
-            self.df = pa.Table.from_pylist(updated_rows, schema=self.df.schema)
-            logger.info(f"[APPLY] UPDATE applied, updated={update_count} rows")
+            # Append updated rows
+            load_df = pa.concat_tables([
+                pa.Table.from_pandas(load_df, schema=self.df.schema),
+                df_upd
+            ]).to_pandas()
+            
+            logger.info(f"[UPDATE] Applied updates, total={len(load_df)}")
 
         # --------------------------------------------------
-        # APPLY INSERT
+        # INSERT
         # --------------------------------------------------
         if df_ins.num_rows > 0:
-            logger.info(f"[APPLY] INSERT adding {df_ins.num_rows} rows")
-            self.df = pa.concat_tables([self.df, df_ins])
-            logger.info(f"[APPLY] INSERT applied")
+            logger.info(f"[INSERT] Adding {df_ins.num_rows} rows")
+            ins_df = df_ins.to_pandas()
+            
+            load_df = pa.concat_tables([
+                pa.Table.from_pandas(load_df, schema=self.df.schema),
+                df_ins
+            ]).to_pandas()
+            
+            logger.info(f"[INSERT] Applied, total={len(load_df)}")
+
+        # Convert back to Arrow
+        self.df = pa.Table.from_pandas(load_df, schema=self.df.schema)
 
         # --------------------------------------------------
         # ARCHIVE + WRITE
         # --------------------------------------------------
-        logger.info(f"[ARCHIVE] Moving {len(cdc_files)} CDC files to processed")
+        logger.info(f"[ARCHIVE] Moving {len(cdc_files)} CDC files")
         for f in cdc_files:
             self.move_file(f, self.get_processed_path(f))
 
-        logger.info(f"[ARCHIVE] Moving LOAD file to processed")
+        logger.info(f"[ARCHIVE] Moving LOAD file")
         self.move_file(load_key, self.get_processed_path(load_key, add_ts=True))
         
-        logger.info(f"[WRITE] Writing new LOAD file")
+        logger.info(f"[WRITE] Writing final LOAD")
         self.write_arrow(load_key, self.df)
 
-        logger.info(f"[DONE] Final LOAD rows={self.df.num_rows}")
+        logger.info(f"[DONE] Final rows={self.df.num_rows}")
 
 
 # --------------------------------------------------
 # Lambda handler
 # --------------------------------------------------
 def lambda_handler(event, context):
-    logger.info(f"[LAMBDA] Starting with {len(event.get('Records', []))} S3 events")
+    logger.info(f"[LAMBDA] Starting")
     
     for r in event.get("Records", []):
         bucket = r["s3"]["bucket"]["name"]
         key = r["s3"]["object"]["key"]
 
-        logger.info(f"[LAMBDA] Processing bucket={bucket}, key={key}")
+        logger.info(f"[LAMBDA] Event: bucket={bucket}, key={key}")
 
         if "/processed/" in key or "LOAD" in key:
-            logger.info(f"[LAMBDA] Skipping processed/LOAD file")
+            logger.info(f"[LAMBDA] Skipping (processed/LOAD)")
             continue
 
         table = key.split("/")[-2]
@@ -340,10 +287,10 @@ def lambda_handler(event, context):
         try:
             CDCProcessorArrow(bucket, table).process(key)
         except Exception as e:
-            logger.error(f"[LAMBDA] Error processing {key}: {str(e)}", exc_info=True)
+            logger.error(f"[LAMBDA] ERROR: {str(e)}", exc_info=True)
             raise
 
-    logger.info(f"[LAMBDA] Completed successfully")
+    logger.info(f"[LAMBDA] SUCCESS")
     return {
         "statusCode": 200,
         "body": json.dumps({"status": "success"}),
