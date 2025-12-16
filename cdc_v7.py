@@ -20,34 +20,30 @@ class CDCProcessorArrow:
         self.pk_col = None
 
         logger.info(
-            f"[INIT] CDCProcessorArrow initialized | bucket={bucket}, table={table}"
+            f"[INIT] CDCProcessorArrow | bucket={bucket}, table={table}"
         )
 
     # -------------------------------------------------
-    # Helper functions
+    # Helpers
     # -------------------------------------------------
     def get_load_prefix(self, key):
-        prefix = "/".join(key.split("/")[:-1]) + "/"
-        logger.debug(f"[PATH] Derived LOAD prefix: {prefix}")
-        return prefix
+        return "/".join(key.split("/")[:-1]) + "/"
 
     def get_processed_path(self, key, add_timestamp=False):
         parts = key.split("/")
         for i, p in enumerate(parts):
             if p.startswith("DSET"):
-                filename = parts[-1]
+                fname = parts[-1]
                 if add_timestamp:
                     ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-                    filename = filename.replace(".csv", f"_{ts}.csv")
-                path = "/".join(
-                    parts[:i + 1] + ["processed"] + parts[i + 1:-1] + [filename]
+                    fname = fname.replace(".csv", f"_{ts}.csv")
+                return "/".join(
+                    parts[:i + 1] + ["processed"] + parts[i + 1:-1] + [fname]
                 )
-                logger.info(f"[ARCHIVE] Processed path resolved: {path}")
-                return path
         raise ValueError("Invalid CDC directory structure")
 
     def move_file(self, src, dst):
-        logger.info(f"[ARCHIVE] Moving file | {src} → {dst}")
+        logger.info(f"[ARCHIVE] {src} → {dst}")
         s3.copy_object(
             Bucket=self.bucket,
             Key=dst,
@@ -56,72 +52,56 @@ class CDCProcessorArrow:
         s3.delete_object(Bucket=self.bucket, Key=src)
 
     def list_cdc_files(self, prefix):
-        logger.info(f"[DISCOVERY] Listing CDC files under prefix: {prefix}")
         paginator = s3.get_paginator("list_objects_v2")
-        out = []
-
+        files = []
         for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
             for obj in page.get("Contents", []):
                 key = obj["Key"]
-                if key.endswith(".csv") and "LOAD" not in key and "/processed/" not in key:
-                    out.append(key)
-
-        logger.info(f"[DISCOVERY] CDC files found: {len(out)} → {out}")
-        return sorted(out)
+                if (
+                    key.endswith(".csv")
+                    and "LOAD" not in key
+                    and "/processed/" not in key
+                ):
+                    files.append(key)
+        logger.info(f"[DISCOVERY] CDC files={files}")
+        return sorted(files)
 
     # -------------------------------------------------
     # Arrow IO
     # -------------------------------------------------
     def load_arrow_table(self, key):
-        logger.info(f"[IO] Loading CSV from S3: {key}")
+        logger.info(f"[IO] Loading {key}")
         obj = s3.get_object(Bucket=self.bucket, Key=key)
         tbl = csv.read_csv(
             obj["Body"],
             parse_options=csv.ParseOptions(delimiter="|")
         )
-        logger.info(
-            f"[IO] Loaded table | rows={tbl.num_rows}, cols={tbl.num_columns}"
-        )
+        logger.info(f"[IO] Loaded rows={tbl.num_rows}")
         return tbl
 
     def write_arrow_table(self, key, table):
-        logger.info(
-            f"[IO] Writing updated LOAD | rows={table.num_rows}, key={key}"
-        )
+        logger.info(f"[IO] Writing LOAD rows={table.num_rows}")
         buf = table.to_pandas().to_csv(index=False, sep="|").encode()
         s3.put_object(Bucket=self.bucket, Key=key, Body=buf)
-        return f"s3://{self.bucket}/{key}"
 
     # -------------------------------------------------
-    # Schema alignment
+    # Schema
     # -------------------------------------------------
     def align_schema(self, tbl, target_schema, op_col):
-        logger.info(
-            f"[SCHEMA] Aligning CDC schema to LOAD schema | rows={tbl.num_rows}"
-        )
         cols = {}
-
         for field in target_schema:
             if field.name in tbl.column_names:
                 col = tbl[field.name]
                 if col.type != field.type:
-                    logger.warning(
-                        f"[SCHEMA] Type mismatch column='{field.name}' "
-                        f"{col.type} → {field.type}, casting"
-                    )
                     try:
                         col = pc.cast(col, field.type)
-                    except Exception as e:
-                        logger.error(
-                            f"[SCHEMA] Cast failed for column='{field.name}': {e}"
-                        )
+                    except Exception:
                         col = pa.array([None] * tbl.num_rows, type=field.type)
                 cols[field.name] = col
             else:
-                logger.warning(
-                    f"[SCHEMA] Missing column in CDC: '{field.name}', filling NULLs"
+                cols[field.name] = pa.array(
+                    [None] * tbl.num_rows, type=field.type
                 )
-                cols[field.name] = pa.array([None] * tbl.num_rows, type=field.type)
 
         return pa.Table.from_arrays(
             [tbl[op_col]] + list(cols.values()),
@@ -132,11 +112,11 @@ class CDCProcessorArrow:
         return pc.utf8_upper(pc.cast(arr, pa.string()))
 
     # -------------------------------------------------
-    # ⭐ CDC COLLAPSE LOGIC WITH LOGGING
+    # ⭐ CDC COLLAPSE
     # -------------------------------------------------
-    def collapse_cdc_rows(self, cdc_tbl: pa.Table, op_col: str):
+    def collapse_cdc_rows(self, cdc_tbl, op_col):
         logger.info(
-            f"[CDC-COLLAPSE] Starting collapse | input_rows={cdc_tbl.num_rows}"
+            f"[CDC-COLLAPSE] Input rows={cdc_tbl.num_rows}"
         )
 
         rows = cdc_tbl.to_pylist()
@@ -152,10 +132,6 @@ class CDCProcessorArrow:
             op = str(r[op_col]).upper()
             pkey = partial_key(r)
 
-            logger.debug(
-                f"[CDC-COLLAPSE] Row#{idx} op={op} key={pkey}"
-            )
-
             if op == "I":
                 logger.info(
                     f"[CDC-COLLAPSE] INSERT staged | key={pkey}"
@@ -163,56 +139,51 @@ class CDCProcessorArrow:
                 state[pkey] = r
 
             elif op == "U":
-                if pkey in state:
-                    logger.info(
-                        f"[CDC-COLLAPSE] UPDATE overwrote previous INSERT | key={pkey}"
-                    )
-                else:
-                    logger.info(
-                        f"[CDC-COLLAPSE] UPDATE recorded | key={pkey}"
-                    )
+                logger.info(
+                    f"[CDC-COLLAPSE] UPDATE overwrite | key={pkey}"
+                )
                 state[pkey] = r
 
             elif op == "D":
                 if pkey in state:
                     logger.info(
-                        f"[CDC-COLLAPSE] DELETE removed pending INSERT/UPDATE | key={pkey}"
+                        f"[CDC-COLLAPSE] DELETE removed staged row | key={pkey}"
                     )
                     del state[pkey]
                 else:
                     logger.info(
-                        f"[CDC-COLLAPSE] DELETE retained (no prior state) | key={pkey}"
+                        f"[CDC-COLLAPSE] DELETE retained | key={pkey}"
                     )
                     final_rows.append(r)
 
         final_rows.extend(state.values())
 
         logger.info(
-            f"[CDC-COLLAPSE] Completed | output_rows={len(final_rows)} "
-            f"(from input {cdc_tbl.num_rows})"
+            f"[CDC-COLLAPSE] Output rows={len(final_rows)}"
         )
 
         return pa.Table.from_pylist(final_rows, schema=cdc_tbl.schema)
 
     # -------------------------------------------------
-    # Main Processor
+    # MAIN PROCESS
     # -------------------------------------------------
     def process(self, cdc_key):
-        logger.info(f"[PROCESS] CDC processing started | file={cdc_key}")
+        logger.info(f"[PROCESS] Start | CDC={cdc_key}")
 
         prefix = self.get_load_prefix(cdc_key)
         load_key = f"{prefix}LOAD00000001.csv"
 
+        # LOAD
         self.df = self.load_arrow_table(load_key)
         self.pk_col = self.df.column_names[0]
 
         logger.info(
-            f"[PROCESS] LOAD loaded | rows={self.df.num_rows}, pk_col={self.pk_col}"
+            f"[PROCESS] LOAD rows={self.df.num_rows}, pk={self.pk_col}"
         )
 
         cdc_files = self.list_cdc_files(prefix)
         if not cdc_files:
-            logger.info("[PROCESS] No CDC files found, exiting")
+            logger.info("[PROCESS] No CDC files")
             return
 
         first = self.load_arrow_table(cdc_files[0])
@@ -220,8 +191,11 @@ class CDCProcessorArrow:
 
         inserts, updates, deletes = [], [], []
 
+        # ---------------------------
+        # CDC PROCESSING
+        # ---------------------------
         for f in cdc_files:
-            logger.info(f"[PROCESS] CDC file → {f}")
+            logger.info(f"[PROCESS] CDC file={f}")
 
             raw = self.load_arrow_table(f)
             aligned = self.align_schema(raw, self.df.schema, op_col)
@@ -234,7 +208,7 @@ class CDCProcessorArrow:
             dele = collapsed.filter(pc.equal(op_arr, "D")).remove_column(0)
 
             logger.info(
-                f"[PROCESS] CDC ops after collapse | "
+                f"[PROCESS] Ops after collapse | "
                 f"I={ins.num_rows}, U={upd.num_rows}, D={dele.num_rows}"
             )
 
@@ -246,28 +220,76 @@ class CDCProcessorArrow:
                 deletes.append(dele)
 
         # ---------------------------
-        # APPLY TO LOAD
+        # APPLY DELETE (full row match)
         # ---------------------------
         if deletes:
             df_del = pa.concat_tables(deletes)
-            logger.info(f"[APPLY] DELETE rows={df_del.num_rows}")
+            before = self.df.num_rows
 
+            del_rows = set(
+                tuple(r.values()) for r in df_del.to_pylist()
+            )
+
+            keep_idx = [
+                i for i, r in enumerate(self.df.to_pylist())
+                if tuple(r.values()) not in del_rows
+            ]
+
+            self.df = self.df.take(keep_idx) if keep_idx else self.df.slice(0, 0)
+
+            logger.info(
+                f"[APPLY] DELETE removed={before - self.df.num_rows}"
+            )
+
+        # ---------------------------
+        # APPLY UPDATE (PK match)
+        # ---------------------------
         if updates:
             df_upd = pa.concat_tables(updates)
-            logger.info(f"[APPLY] UPDATE rows={df_upd.num_rows}")
+            before = self.df.num_rows
 
+            upd_keys = set(df_upd[self.pk_col].to_pylist())
+
+            keep_idx = [
+                i for i, pk in enumerate(self.df[self.pk_col].to_pylist())
+                if pk not in upd_keys
+            ]
+
+            self.df = self.df.take(keep_idx) if keep_idx else self.df.slice(0, 0)
+            self.df = pa.concat_tables([self.df, df_upd])
+
+            logger.info(
+                f"[APPLY] UPDATE replaced={before - len(keep_idx)}, "
+                f"added={df_upd.num_rows}"
+            )
+
+        # ---------------------------
+        # APPLY INSERT
+        # ---------------------------
         if inserts:
             df_ins = pa.concat_tables(inserts)
-            logger.info(f"[APPLY] INSERT rows={df_ins.num_rows}")
+            self.df = pa.concat_tables([self.df, df_ins])
 
-        # Archive CDC files
+            logger.info(
+                f"[APPLY] INSERT added={df_ins.num_rows}"
+            )
+
+        # ---------------------------
+        # ARCHIVE + WRITE
+        # ---------------------------
         for f in cdc_files:
             self.move_file(f, self.get_processed_path(f))
 
-        self.move_file(load_key, self.get_processed_path(load_key, True))
+        self.move_file(
+            load_key,
+            self.get_processed_path(load_key, add_timestamp=True)
+        )
+
         self.write_arrow_table(load_key, self.df)
 
-        logger.info("[PROCESS] CDC processing completed successfully")
+        logger.info(
+            f"[PROCESS] Completed | final_rows={self.df.num_rows}"
+        )
 
 
 # -------------------------------------------------
@@ -281,11 +303,14 @@ def lambda_handler(event, context):
         bucket = r["s3"]["bucket"]["name"]
         key = r["s3"]["object"]["key"]
 
-        if "LOAD" in key or "/processed/" in key:
-            logger.info(f"[LAMBDA] Skipping file: {key}")
+        if "/processed/" in key or "LOAD" in key:
+            logger.info(f"[LAMBDA] Skipped {key}")
             continue
 
         table = key.split("/")[-2]
         CDCProcessorArrow(bucket, table).process(key)
 
-    return {"statusCode": 200, "body": json.dumps({"status": "success"})}
+    return {
+        "statusCode": 200,
+        "body": json.dumps({"status": "success"})
+    }
