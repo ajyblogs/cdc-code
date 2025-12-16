@@ -131,7 +131,7 @@ class CDCProcessorArrow:
         to_keep = pc.invert(mask)
         deleted = pc.sum(pc.cast(mask, pa.int64())).as_py()
     
-        return base.filter(to_keep), deleted
+        return base.filter(to_keep)
 
     # -------------------------------------------------
     # Main CDC Application (Order Preserving)
@@ -146,7 +146,7 @@ class CDCProcessorArrow:
                 self.delete_count += 1
 
             elif op == "U":
-                base, deleted = self.delete_partial_matching_rows(base, row)
+                base = self.delete_partial_matching_rows(base, row)
                 base = pa.concat_tables([base, row])
                 self.update_count += 1
 
