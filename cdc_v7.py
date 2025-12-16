@@ -64,6 +64,25 @@ class CDCProcessorArrow:
         return files
 
     # ------------------------
+    # Schema inference from CDC
+    # ------------------------
+    def infer_load_schema(self, load_tbl, sample_cdc_tbls):
+        fields = []
+        for f in load_tbl.schema:
+            if pa.types.is_null(f.type):
+                inferred_type = None
+                for cdc_tbl in sample_cdc_tbls:
+                    if f.name in cdc_tbl.column_names:
+                        cdc_type = cdc_tbl.schema.field(f.name).type
+                        if not pa.types.is_null(cdc_type):
+                            inferred_type = cdc_type
+                            break
+                fields.append(pa.field(f.name, inferred_type or pa.string()))
+            else:
+                fields.append(f)
+        return pa.schema(fields)
+
+    # ------------------------
     # Schema alignment
     # ------------------------
     def align_schema(self, cdc_tbl, target_schema, op_col):
@@ -86,12 +105,9 @@ class CDCProcessorArrow:
             return
         mask = pa.array([True] * self.df.num_rows)
         for col in self.df.column_names:
-            del_col = df_del[col]
-            df_col = self.df[col]
-            col_mask = ~pc.is_in(df_col, del_col)
-            mask = pc.and_(mask, col_mask)
+            mask = pc.and_(mask, ~pc.is_in(self.df[col], df_del[col]))
         self.df = self.df.filter(mask)
-        logger.info(f"[DELETE] applied, remaining LOAD rows={self.df.num_rows}")
+        logger.info(f"[DELETE] applied, LOAD rows={self.df.num_rows}")
 
     # ------------------------
     # Vectorised UPDATE (PK-based)
@@ -100,10 +116,8 @@ class CDCProcessorArrow:
         if df_upd.num_rows == 0:
             return
         pk_values = df_upd[self.pk_col]
-        # Identify rows to replace in LOAD
         mask = ~pc.is_in(self.df[self.pk_col], pk_values)
         remaining = self.df.filter(mask)
-        # Append updated rows
         self.df = pa.concat_tables([remaining, df_upd])
         logger.info(f"[UPDATE] applied, LOAD rows={self.df.num_rows}")
 
@@ -129,15 +143,24 @@ class CDCProcessorArrow:
         initial_rows = self.df.num_rows
         logger.info(f"[LOAD] initial rows={initial_rows}")
 
-        # Process CDC files one by one
+        # Discover CDC files
         cdc_files = self.list_cdc_files(prefix)
         if not cdc_files:
             logger.info("[SKIP] no CDC files")
             return
 
-        op_col = self.read_arrow(cdc_files[0]).column_names[0]
+        # Sample first few CDC files for schema inference (max 5)
+        sample_cdc = [self.read_arrow(f) for f in cdc_files[:5]]
+        inferred_schema = self.infer_load_schema(self.df, sample_cdc)
+        if inferred_schema != self.df.schema:
+            self.df = self.df.cast(inferred_schema)
+            logger.info("[SCHEMA] LOAD schema upgraded from CDC inference")
+
+        # Detect operation column
+        op_col = sample_cdc[0].column_names[0]
         total_ins = total_upd = total_del = 0
 
+        # Process each CDC file sequentially
         for f in cdc_files:
             cdc_tbl = self.read_arrow(f)
             aligned = self.align_schema(cdc_tbl, self.df.schema, op_col)
@@ -170,15 +193,11 @@ class CDCProcessorArrow:
 # ------------------------
 def lambda_handler(event, context):
     logger.info(json.dumps(event))
-
     for r in event.get("Records", []):
         bucket = r["s3"]["bucket"]["name"]
         key = r["s3"]["object"]["key"]
-
         if "LOAD" in key or "/processed/" in key:
             continue
-
         table = key.split("/")[-2]
         CDCProcessorArrow(bucket, table).process(key)
-
     return {"statusCode": 200, "body": json.dumps({"status": "success"})}
