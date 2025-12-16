@@ -100,7 +100,7 @@ class CDCProcessorArrow:
     def write_arrow(self, key, table):
         buf = table.to_pandas().to_csv(index=False, sep="|").encode()
         s3.put_object(Bucket=self.bucket, Key=key, Body=buf)
-        logger.info(f"[WRITE] LOAD updated rows={table.num_rows}")
+        logger.info(f"[WRITE] LOAD rows={table.num_rows}")
 
     # --------------------------------------------------
     # Schema alignment
@@ -125,33 +125,34 @@ class CDCProcessorArrow:
         return pa.Table.from_arrays(arrays, names=names)
 
     # --------------------------------------------------
-    # CDC collapse (CRITICAL FIX)
+    # CDC collapse (INSERT + UPDATE dedupe by PK)
     # --------------------------------------------------
     def collapse_all_cdc(self, cdc_tbl, op_col):
         logger.info(f"[CDC-COLLAPSE] input rows={cdc_tbl.num_rows}")
 
         rows = cdc_tbl.to_pylist()
-        staged = {}     # pk → latest INSERT/UPDATE
-        deletes = []    # full-row DELETE
+        staged = {}     # pk -> latest INSERT/UPDATE
+        deletes = []    # full-row DELETEs
 
         for r in rows:
             op = str(r[op_col]).upper()
             pk = r[self.pk_col]
 
             if op == "I":
-                logger.info(f"[CDC-COLLAPSE] INSERT staged pk={pk}")
                 staged[pk] = r
+                logger.info(f"[CDC-COLLAPSE] INSERT staged pk={pk}")
 
             elif op == "U":
-                logger.info(f"[CDC-COLLAPSE] UPDATE overwrote pk={pk}")
                 staged[pk] = r
+                logger.info(f"[CDC-COLLAPSE] UPDATE overwrote pk={pk}")
 
             elif op == "D":
                 if pk in staged:
-                    logger.info(f"[CDC-COLLAPSE] DELETE removed staged pk={pk}")
                     del staged[pk]
+                    logger.info(f"[CDC-COLLAPSE] DELETE removed staged pk={pk}")
                 else:
                     deletes.append(r)
+                    logger.info("[CDC-COLLAPSE] DELETE retained (full row)")
 
         final_rows = list(staged.values()) + deletes
         logger.info(f"[CDC-COLLAPSE] output rows={len(final_rows)}")
@@ -214,16 +215,21 @@ class CDCProcessorArrow:
         )
 
         # ----------------------------
-        # APPLY DELETE (full row)
+        # APPLY DELETE (FULL ROW MATCH)
         # ----------------------------
         if df_del.num_rows > 0:
-            del_rows = {tuple(r.values()) for r in df_del.to_pylist()}
+            col_order = self.df.column_names
+
+            def row_tuple(row):
+                return tuple(row[c] for c in col_order)
+
+            delete_set = {row_tuple(r) for r in df_del.to_pylist()}
             before = self.df.num_rows
 
             keep_idx = [
                 i
                 for i, r in enumerate(self.df.to_pylist())
-                if tuple(r.values()) not in del_rows
+                if row_tuple(r) not in delete_set
             ]
 
             self.df = (
@@ -232,10 +238,12 @@ class CDCProcessorArrow:
                 else self.df.slice(0, 0)
             )
 
-            logger.info(f"[APPLY] DELETE removed={before - self.df.num_rows}")
+            logger.info(
+                f"[APPLY] DELETE removed={before - self.df.num_rows}"
+            )
 
         # ----------------------------
-        # APPLY UPDATE (PK only)
+        # APPLY UPDATE (PK ONLY)
         # ----------------------------
         if df_upd.num_rows > 0:
             upd_keys = set(df_upd[self.pk_col].to_pylist())
@@ -254,6 +262,7 @@ class CDCProcessorArrow:
             )
 
             self.df = pa.concat_tables([self.df, df_upd])
+
             logger.info(
                 f"[APPLY] UPDATE replaced={before - len(keep_idx)}, "
                 f"added={df_upd.num_rows}"
