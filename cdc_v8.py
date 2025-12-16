@@ -114,8 +114,6 @@ class CDCProcessorArrow:
 
         to_keep = pc.invert(mask)
         deleted = pc.sum(pc.cast(mask, pa.int64())).as_py()
-
-        self.delete_count += deleted
         return base.filter(to_keep)
 
     # -------------------------------------------------
