@@ -22,7 +22,7 @@ class CDCProcessorArrow:
         logger.info(f"CDC Processor initialized for bucket={bucket}, table={table}")
 
     # -------------------------------------------------
-    # Helper functions
+    # Helpers
     # -------------------------------------------------
     def get_load_prefix(self, key):
         return "/".join(key.split("/")[:-1]) + "/"
@@ -35,7 +35,7 @@ class CDCProcessorArrow:
                 if add_timestamp:
                     ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
                     filename = filename.replace(".csv", f"_{ts}.csv")
-                return "/".join(parts[:i + 1] + ["processed"] + parts[i + 1:-1] + [filename])
+                return "/".join(parts[: i + 1] + ["processed"] + parts[i + 1 : -1] + [filename])
         raise ValueError("Invalid CDC directory structure")
 
     def move_file(self, src, dst):
@@ -49,13 +49,13 @@ class CDCProcessorArrow:
 
     def list_cdc_files(self, prefix):
         paginator = s3.get_paginator("list_objects_v2")
-        files = []
+        out = []
         for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
             for obj in page.get("Contents", []):
                 key = obj["Key"]
                 if key.endswith(".csv") and "LOAD" not in key and "/processed/" not in key:
-                    files.append(key)
-        return sorted(files)
+                    out.append(key)
+        return sorted(out)
 
     # -------------------------------------------------
     # Arrow I/O
@@ -73,11 +73,10 @@ class CDCProcessorArrow:
         return f"s3://{self.bucket}/{key}"
 
     # -------------------------------------------------
-    # Schema alignment (CDC → LOAD)
+    # Align CDC → LOAD schema (no mutation)
     # -------------------------------------------------
     def align_schema(self, cdc_tbl, load_schema, op_col):
         cols = {}
-
         for field in load_schema:
             name = field.name
             if name in cdc_tbl.column_names:
@@ -97,40 +96,43 @@ class CDCProcessorArrow:
         )
 
     # -------------------------------------------------
-    # CDC COLLAPSE (🔥 core fix)
+    # 🔥 CDC collapse (FIXED)
     # -------------------------------------------------
     def collapse_cdc_by_pk(self, tbl, pk_col):
+        """
+        Keep only LAST CDC record per PK.
+        OP column may be first.
+        """
         logger.info("Collapsing CDC records by PK")
 
+        if pk_col not in tbl.column_names:
+            raise ValueError(
+                f"Primary key '{pk_col}' not found in CDC columns: {tbl.column_names}"
+            )
+
+        # Preserve order
         row_id = pa.array(range(tbl.num_rows), type=pa.int64())
         tbl = tbl.append_column("__row_id__", row_id)
 
-        sorted_tbl = tbl.sort_by(
+        # Latest record per PK first
+        tbl = tbl.sort_by(
             [(pk_col, "ascending"), ("__row_id__", "descending")]
         )
 
-        dedup = sorted_tbl.group_by(pk_col).aggregate(
-            [("__row_id__", "min")]
-        )
+        # Deduplicate by PK
+        tbl = tbl.unique(subset=[pk_col], keep="first")
 
-        final = (
-            dedup.join(
-                sorted_tbl,
-                keys=pk_col,
-                right_keys=pk_col,
-                join_type="inner",
-            )
-            .drop(["__row_id__"])
-        )
+        # Cleanup
+        tbl = tbl.drop(["__row_id__"])
 
-        logger.info(f"CDC collapsed {tbl.num_rows} → {final.num_rows}")
-        return final
+        logger.info(f"CDC collapsed → {tbl.num_rows} rows")
+        return tbl
 
     def safe_upper(self, arr):
         return pc.utf8_upper(pc.cast(arr, pa.string()))
 
     # -------------------------------------------------
-    # Main process
+    # Main
     # -------------------------------------------------
     def process(self, cdc_key):
         start = datetime.utcnow()
@@ -138,13 +140,13 @@ class CDCProcessorArrow:
         prefix = self.get_load_prefix(cdc_key)
         load_key = f"{prefix}LOAD00000001.csv"
 
-        # LOAD
+        # LOAD (schema is truth)
         self.df = self.load_arrow_table(load_key)
-        self.pk_col = self.df.column_names[0]
         load_schema = self.df.schema
+        self.pk_col = load_schema.names[0]
         initial_rows = self.df.num_rows
 
-        # CDC files
+        # CDC
         cdc_files = self.list_cdc_files(prefix)
         first_cdc = self.load_arrow_table(cdc_files[0])
         op_col = first_cdc.column_names[0]
@@ -153,9 +155,10 @@ class CDCProcessorArrow:
 
         for f in cdc_files:
             raw = self.load_arrow_table(f)
+
             aligned = self.align_schema(raw, load_schema, op_col)
 
-            # 🔥 collapse per PK BEFORE touching LOAD
+            # 🔥 collapse BEFORE touching LOAD
             aligned = self.collapse_cdc_by_pk(aligned, self.pk_col)
 
             op = self.safe_upper(aligned[op_col])
@@ -175,22 +178,22 @@ class CDCProcessorArrow:
         # ---------------- DELETE ----------------
         if df_del.num_rows:
             del_keys = set(df_del[self.pk_col].to_pylist())
-            keep_idx = [
+            keep = [
                 i
                 for i, k in enumerate(self.df[self.pk_col].to_pylist())
                 if k not in del_keys
             ]
-            self.df = self.df.take(keep_idx) if keep_idx else pa.table({}, schema=load_schema)
+            self.df = self.df.take(keep) if keep else pa.table({}, schema=load_schema)
 
         # ---------------- UPDATE ----------------
         if df_upd.num_rows:
             upd_keys = set(df_upd[self.pk_col].to_pylist())
-            keep_idx = [
+            keep = [
                 i
                 for i, k in enumerate(self.df[self.pk_col].to_pylist())
                 if k not in upd_keys
             ]
-            self.df = self.df.take(keep_idx) if keep_idx else pa.table({}, schema=load_schema)
+            self.df = self.df.take(keep) if keep else pa.table({}, schema=load_schema)
             self.df = pa.concat_tables([self.df, df_upd])
 
         # ---------------- INSERT ----------------
@@ -223,7 +226,7 @@ class CDCProcessorArrow:
 
 
 # -------------------------------------------------
-# Lambda Handler
+# Lambda handler
 # -------------------------------------------------
 def lambda_handler(event, context):
     logger.info(json.dumps(event))
