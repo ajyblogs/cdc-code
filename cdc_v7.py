@@ -99,32 +99,46 @@ class CDCProcessorArrow:
     # 🔥 CDC collapse (FIXED)
     # -------------------------------------------------
     def collapse_cdc_by_pk(self, tbl, pk_col):
-        """
-        Keep only LAST CDC record per PK.
-        OP column may be first.
-        """
+    """
+    Keep only the LAST CDC record per PK.
+    Works on older PyArrow versions (no Table.unique).
+    """
         logger.info("Collapsing CDC records by PK")
-
+    
         if pk_col not in tbl.column_names:
             raise ValueError(
                 f"Primary key '{pk_col}' not found in CDC columns: {tbl.column_names}"
             )
-
-        # Preserve order
+    
+        # Add row number to preserve CDC order
         row_id = pa.array(range(tbl.num_rows), type=pa.int64())
         tbl = tbl.append_column("__row_id__", row_id)
-
-        # Latest record per PK first
-        tbl = tbl.sort_by(
-            [(pk_col, "ascending"), ("__row_id__", "descending")]
-        )
-
-        # Deduplicate by PK
-        tbl = tbl.unique(subset=[pk_col], keep="first")
-
+    
+        # Sort so latest record per PK comes first
+        tbl = tbl.sort_by([
+            (pk_col, "ascending"),
+            ("__row_id__", "descending")
+        ])
+    
+        # --- Deduplicate manually ---
+        # Get first occurrence index per PK
+        pk_arr = tbl[pk_col]
+        _, first_indices = pc.unique(pk_arr, return_inverse=True)
+    
+        # We want FIRST row per PK after sorting
+        seen = set()
+        keep_indices = []
+        for i, pk in enumerate(pk_arr.to_pylist()):
+            if pk not in seen:
+                seen.add(pk)
+                keep_indices.append(i)
+    
+        # Take rows
+        tbl = tbl.take(pa.array(keep_indices, type=pa.int64()))
+    
         # Cleanup
         tbl = tbl.drop(["__row_id__"])
-
+    
         logger.info(f"CDC collapsed → {tbl.num_rows} rows")
         return tbl
 
