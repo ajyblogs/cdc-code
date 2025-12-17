@@ -35,7 +35,9 @@ class CDCProcessorArrow:
                 if add_timestamp:
                     ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
                     filename = filename.replace(".csv", f"_{ts}.csv")
-                return "/".join(parts[: i + 1] + ["processed"] + parts[i + 1 : -1] + [filename])
+                return "/".join(
+                    parts[: i + 1] + ["processed"] + parts[i + 1 : -1] + [filename]
+                )
         raise ValueError("Invalid CDC directory structure")
 
     def move_file(self, src, dst):
@@ -73,7 +75,7 @@ class CDCProcessorArrow:
         return f"s3://{self.bucket}/{key}"
 
     # -------------------------------------------------
-    # Align CDC → LOAD schema (no mutation)
+    # Align CDC → LOAD schema
     # -------------------------------------------------
     def align_schema(self, cdc_tbl, load_schema, op_col):
         cols = {}
@@ -96,49 +98,41 @@ class CDCProcessorArrow:
         )
 
     # -------------------------------------------------
-    # 🔥 CDC collapse (FIXED)
+    # 🔥 CDC COLLAPSE (OLDER PYARROW SAFE)
     # -------------------------------------------------
     def collapse_cdc_by_pk(self, tbl, pk_col):
-    """
-    Keep only the LAST CDC record per PK.
-    Works on older PyArrow versions (no Table.unique).
-    """
+        """
+        Keep only the LAST CDC record per PK.
+        Compatible with older PyArrow versions (no Table.unique).
+        """
         logger.info("Collapsing CDC records by PK")
-    
+
         if pk_col not in tbl.column_names:
             raise ValueError(
                 f"Primary key '{pk_col}' not found in CDC columns: {tbl.column_names}"
             )
-    
-        # Add row number to preserve CDC order
+
+        # Preserve CDC order
         row_id = pa.array(range(tbl.num_rows), type=pa.int64())
         tbl = tbl.append_column("__row_id__", row_id)
-    
-        # Sort so latest record per PK comes first
-        tbl = tbl.sort_by([
-            (pk_col, "ascending"),
-            ("__row_id__", "descending")
-        ])
-    
-        # --- Deduplicate manually ---
-        # Get first occurrence index per PK
-        pk_arr = tbl[pk_col]
-        _, first_indices = pc.unique(pk_arr, return_inverse=True)
-    
-        # We want FIRST row per PK after sorting
+
+        # Latest record per PK comes first
+        tbl = tbl.sort_by(
+            [(pk_col, "ascending"), ("__row_id__", "descending")]
+        )
+
+        pk_values = tbl[pk_col].to_pylist()
+
         seen = set()
         keep_indices = []
-        for i, pk in enumerate(pk_arr.to_pylist()):
+        for i, pk in enumerate(pk_values):
             if pk not in seen:
                 seen.add(pk)
                 keep_indices.append(i)
-    
-        # Take rows
+
         tbl = tbl.take(pa.array(keep_indices, type=pa.int64()))
-    
-        # Cleanup
         tbl = tbl.drop(["__row_id__"])
-    
+
         logger.info(f"CDC collapsed → {tbl.num_rows} rows")
         return tbl
 
@@ -146,7 +140,7 @@ class CDCProcessorArrow:
         return pc.utf8_upper(pc.cast(arr, pa.string()))
 
     # -------------------------------------------------
-    # Main
+    # Main process
     # -------------------------------------------------
     def process(self, cdc_key):
         start = datetime.utcnow()
@@ -169,10 +163,9 @@ class CDCProcessorArrow:
 
         for f in cdc_files:
             raw = self.load_arrow_table(f)
-
             aligned = self.align_schema(raw, load_schema, op_col)
 
-            # 🔥 collapse BEFORE touching LOAD
+            # 🔥 collapse CDC BEFORE touching LOAD
             aligned = self.collapse_cdc_by_pk(aligned, self.pk_col)
 
             op = self.safe_upper(aligned[op_col])
