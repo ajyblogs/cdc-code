@@ -89,7 +89,7 @@ class CDCProcessorArrow:
         )
 
     # -------------------------------------------------
-    # 🔥 CDC collapse with INSERT→DELETE awareness
+    # CDC collapse
     # -------------------------------------------------
     def collapse_cdc_by_pk(self, tbl, pk_col, op_col):
         rows = tbl.to_pylist()
@@ -131,6 +131,18 @@ class CDCProcessorArrow:
         return pc.utf8_upper(pc.cast(arr, pa.string()))
 
     # -------------------------------------------------
+    # Row hash builder for DELETE
+    # -------------------------------------------------
+    def build_row_hash(self, tbl, cols):
+        arrays = [pc.cast(tbl[c], pa.string()) for c in cols]
+
+        combined = arrays[0]
+        for a in arrays[1:]:
+            combined = pc.binary_join_element_wise(combined, a, "")
+
+        return pc.hash(combined)
+
+    # -------------------------------------------------
     # Main process
     # -------------------------------------------------
     def process(self, cdc_key):
@@ -154,7 +166,7 @@ class CDCProcessorArrow:
             raw = self.load_arrow_table(f)
             aligned = self.align_schema(raw, load_schema, op_col)
 
-            # 🔥 collapse before touching LOAD
+            # collapse CDC before touching LOAD
             collapsed = self.collapse_cdc_by_pk(aligned, self.pk_col, op_col)
 
             op = self.safe_upper(collapsed[op_col])
@@ -169,31 +181,29 @@ class CDCProcessorArrow:
 
         # ---------------- DELETE (FULL ROW MATCH) ----------------
         if df_del.num_rows:
-            del_rows = df_del.to_pylist()
-            del_set = {
-                tuple(r[c] for c in load_schema.names)
-                for r in del_rows
-            }
+            cols = load_schema.names
+            load_hash = self.build_row_hash(self.df, cols)
+            del_hash = self.build_row_hash(df_del, cols)
+            mask = pc.invert(pc.is_in(load_hash, del_hash))
+            self.df = self.df.filter(mask)
 
-            keep = []
-            for i, r in enumerate(self.df.to_pylist()):
-                if tuple(r[c] for c in load_schema.names) not in del_set:
-                    keep.append(i)
-
-            self.df = self.df.take(keep) if keep else pa.table({}, schema=load_schema)
-
-        # ---------------- UPDATE (PK replace) ----------------
+        # ---------------- UPDATE (in-place, preserve LOAD row count) ----------------
         if df_upd.num_rows:
-            upd_keys = set(df_upd[self.pk_col].to_pylist())
+            # Map PK -> CDC row
+            upd_dict = {r[self.pk_col]: r for r in df_upd.to_pylist()}
 
-            keep = [
-                i
-                for i, k in enumerate(self.df[self.pk_col].to_pylist())
-                if k not in upd_keys
-            ]
+            keep_rows = []
+            updated_rows = []
 
-            self.df = self.df.take(keep) if keep else pa.table({}, schema=load_schema)
-            self.df = pa.concat_tables([self.df, df_upd])
+            for r in self.df.to_pylist():
+                pk = r[self.pk_col]
+                if pk in upd_dict:
+                    # Replace this row with CDC row values
+                    updated_rows.append(dict(upd_dict[pk]))
+                else:
+                    keep_rows.append(r)
+
+            self.df = pa.Table.from_pylist(keep_rows + updated_rows, schema=self.df.schema)
 
         # ---------------- INSERT ----------------
         if df_ins.num_rows:
