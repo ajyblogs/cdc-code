@@ -78,6 +78,28 @@ class CDCProcessorArrow:
         logger.info(f"CDC files discovered: {out}")
         return sorted(out)
 
+    def collapse_cdc_insert_update(self, cdc_tbl, op_col):
+        data_cols = [c for c in cdc_tbl.column_names if c != op_col]
+    
+        seen = set()
+        keep_indices = []
+    
+        # iterate bottom-up
+        for i in range(cdc_tbl.num_rows - 1, -1, -1):
+            row_key = tuple(
+                cdc_tbl[c][i].as_py() for c in data_cols
+            )
+    
+            if row_key in seen:
+                continue
+    
+            seen.add(row_key)
+            keep_indices.append(i)
+    
+        keep_indices.reverse()
+    
+        return cdc_tbl.take(pa.array(keep_indices))
+
     # --------------------------------------------------
     # Arrow IO
     # --------------------------------------------------
@@ -203,7 +225,8 @@ class CDCProcessorArrow:
 
         for f in cdc_files:
             raw = self.load_arrow_table(f)
-            aligned = self.align_schema(raw, schema, op_col)
+            aligned_raw = self.align_schema(raw, schema, op_col)
+            aligned = self.collapse_cdc_insert_update(aligned_raw, op_col)
 
             logger.info(f"Applying CDC file sequentially: {f}")
             self.df = self.apply_cdc_no_pk(
