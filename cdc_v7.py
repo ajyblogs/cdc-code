@@ -187,23 +187,30 @@ class CDCProcessorArrow:
             mask = pc.invert(pc.is_in(load_hash, del_hash))
             self.df = self.df.filter(mask)
 
-        # ---------------- UPDATE (in-place, preserve LOAD row count) ----------------
+        # ---------------- UPDATE (Arrow-native broadcast, preserves repeated LOAD rows) ----------------
         if df_upd.num_rows:
-            # Map PK -> CDC row
-            upd_dict = {r[self.pk_col]: r for r in df_upd.to_pylist()}
+            # Mask for LOAD rows that match UPDATE PKs
+            mask = pc.is_in(self.df[self.pk_col], df_upd[self.pk_col])
 
-            keep_rows = []
-            updated_rows = []
+            # Rows to keep
+            keep = self.df.filter(pc.invert(mask))
+            to_update = self.df.filter(mask)
 
-            for r in self.df.to_pylist():
-                pk = r[self.pk_col]
-                if pk in upd_dict:
-                    # Replace this row with CDC row values
-                    updated_rows.append(dict(upd_dict[pk]))
-                else:
-                    keep_rows.append(r)
+            # Build a dictionary for CDC values
+            upd_dict = {r[self.pk_col].as_py(): r for r in df_upd.to_batches()[0].to_pylist()}
 
-            self.df = pa.Table.from_pylist(keep_rows + updated_rows, schema=self.df.schema)
+            # Create lists to broadcast CDC rows over LOAD
+            new_rows = []
+            for batch in to_update.to_batches():
+                for r in batch.to_pylist():
+                    pk = r[self.pk_col]
+                    new_rows.append(dict(upd_dict[pk]))
+
+            if new_rows:
+                upd_table = pa.Table.from_pylist(new_rows, schema=self.df.schema)
+                self.df = pa.concat_tables([keep, upd_table])
+            else:
+                self.df = keep
 
         # ---------------- INSERT ----------------
         if df_ins.num_rows:
