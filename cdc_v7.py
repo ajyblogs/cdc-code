@@ -33,7 +33,9 @@ class CDCProcessorArrow:
                 if add_timestamp:
                     ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
                     filename = filename.replace(".csv", f"_{ts}.csv")
-                return "/".join(parts[: i + 1] + ["processed"] + parts[i + 1 : -1] + [filename])
+                return "/".join(
+                    parts[: i + 1] + ["processed"] + parts[i + 1 : -1] + [filename]
+                )
         raise ValueError("Invalid CDC directory structure")
 
     def move_file(self, src, dst):
@@ -59,7 +61,9 @@ class CDCProcessorArrow:
     # -------------------------------------------------
     def load_arrow_table(self, key):
         obj = s3.get_object(Bucket=self.bucket, Key=key)
-        return csv.read_csv(obj["Body"], parse_options=csv.ParseOptions(delimiter="|"))
+        return csv.read_csv(
+            obj["Body"], parse_options=csv.ParseOptions(delimiter="|")
+        )
 
     def write_arrow_table(self, key, table):
         buf = table.to_pandas().to_csv(index=False, sep="|").encode()
@@ -89,7 +93,7 @@ class CDCProcessorArrow:
         )
 
     # -------------------------------------------------
-    # 🔥 CDC collapse with INSERT→DELETE awareness
+    # CDC collapse
     # -------------------------------------------------
     def collapse_cdc_by_pk(self, tbl, pk_col, op_col):
         rows = tbl.to_pylist()
@@ -103,7 +107,7 @@ class CDCProcessorArrow:
                 state[pk] = {"ops": [], "row": row}
 
             state[pk]["ops"].append(op)
-            state[pk]["row"] = row  # last row wins
+            state[pk]["row"] = row
 
         final_rows = []
 
@@ -131,6 +135,18 @@ class CDCProcessorArrow:
         return pc.utf8_upper(pc.cast(arr, pa.string()))
 
     # -------------------------------------------------
+    # 🔥 NEW: Row hash builder (used ONLY for DELETE)
+    # -------------------------------------------------
+    def build_row_hash(self, tbl, cols):
+        arrays = [pc.cast(tbl[c], pa.string()) for c in cols]
+
+        combined = arrays[0]
+        for a in arrays[1:]:
+            combined = pc.binary_join_element_wise(combined, a, "")
+
+        return pc.hash(combined)
+
+    # -------------------------------------------------
     # Main process
     # -------------------------------------------------
     def process(self, cdc_key):
@@ -153,8 +169,6 @@ class CDCProcessorArrow:
         for f in cdc_files:
             raw = self.load_arrow_table(f)
             aligned = self.align_schema(raw, load_schema, op_col)
-
-            # 🔥 collapse before touching LOAD
             collapsed = self.collapse_cdc_by_pk(aligned, self.pk_col, op_col)
 
             op = self.safe_upper(collapsed[op_col])
@@ -167,32 +181,23 @@ class CDCProcessorArrow:
         df_upd = pa.concat_tables(upd) if upd else pa.table({}, schema=load_schema)
         df_del = pa.concat_tables(dele) if dele else pa.table({}, schema=load_schema)
 
-        # ---------------- DELETE (FULL ROW MATCH) ----------------
+        # ---------------- DELETE (ALL COLUMN MATCH – FIXED) ----------------
         if df_del.num_rows:
-            del_rows = df_del.to_pylist()
-            del_set = {
-                tuple(r[c] for c in load_schema.names)
-                for r in del_rows
-            }
+            cols = load_schema.names
 
-            keep = []
-            for i, r in enumerate(self.df.to_pylist()):
-                if tuple(r[c] for c in load_schema.names) not in del_set:
-                    keep.append(i)
+            load_hash = self.build_row_hash(self.df, cols)
+            del_hash = self.build_row_hash(df_del, cols)
 
-            self.df = self.df.take(keep) if keep else pa.table({}, schema=load_schema)
+            mask = pc.invert(pc.is_in(load_hash, del_hash))
+            self.df = self.df.filter(mask)
 
         # ---------------- UPDATE (PK replace) ----------------
         if df_upd.num_rows:
             upd_keys = set(df_upd[self.pk_col].to_pylist())
-
-            keep = [
-                i
-                for i, k in enumerate(self.df[self.pk_col].to_pylist())
-                if k not in upd_keys
-            ]
-
-            self.df = self.df.take(keep) if keep else pa.table({}, schema=load_schema)
+            mask = pc.invert(
+                pc.is_in(self.df[self.pk_col], pa.array(list(upd_keys)))
+            )
+            self.df = self.df.filter(mask)
             self.df = pa.concat_tables([self.df, df_upd])
 
         # ---------------- INSERT ----------------
