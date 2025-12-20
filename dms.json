@@ -1,0 +1,15 @@
+{
+         "rule-type": "transformation",
+         "rule-id": "1",
+         "rule-name": "remove-newlines",
+         "rule-target": "column",
+         "object-locator": {
+           "schema-name": "%",
+           "table-name": "%",
+           "column-name": "description"
+         },
+         "rule-action": "replace",
+         "value": " ",
+         "expression": "\\n",
+         "expression-type": "regex"
+       }
